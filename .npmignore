@@ -1,0 +1,40 @@
+# Development files
+.github/
+.idea/
+.vscode/
+coverage/
+node_modules/
+
+# Source maps (optional - keep if useful for debugging)
+# dist/*.map
+
+# iOS development files
+ios/Pods/
+ios/*.xcworkspace/
+ios/*.xcodeproj/xcuserdata/
+ios/DerivedData/
+ios/.build/
+
+# Android development files
+android/.gradle/
+android/.idea/
+android/local.properties
+android/*.iml
+
+# Test files
+**/*.spec.ts
+**/*.test.ts
+jest.config.js
+
+# Config files
+.eslintrc
+.prettierrc
+.prettierignore
+.swiftlint.yml
+tsconfig.json
+rollup.config.mjs
+
+# Misc
+.DS_Store
+*.log
+.env*
