@@ -1,6 +1,6 @@
 {
   "name": "@capivv/capacitor-sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Capacitor plugin for Capivv - Revenue as Code for subscription management",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
@@ -47,7 +47,7 @@
     "prettier": "prettier \"**/*.{css,html,ts,js,java}\"",
     "swiftlint": "node-swiftlint",
     "docgen": "docgen --api CapivvPlugin --output-readme README.md --output-json dist/docs.json",
-    "build": "npm run clean && npm run docgen && tsc && rollup -c rollup.config.mjs",
+    "build": "npm run clean && tsc && rollup -c rollup.config.mjs",
     "clean": "rimraf ./dist",
     "watch": "tsc --watch",
     "prepublishOnly": "npm run build"
@@ -71,7 +71,7 @@
     "vitest": "^4.0.17"
   },
   "peerDependencies": {
-    "@capacitor/core": "^6.0.0"
+    "@capacitor/core": ">=6.0.0"
   },
   "prettier": "@ionic/prettier-config",
   "swiftlint": "@ionic/swiftlint-config",

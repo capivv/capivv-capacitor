@@ -1,11 +1,9 @@
 // Framework-specific components for Ionic
-// Import the appropriate component for your framework
+// These components require their respective framework dependencies
+// and are distributed separately.
+//
+// For React: @capivv/capacitor-react
+// For Angular: @capivv/capacitor-angular
+// For Vue: @capivv/capacitor-vue
 
-// Angular
-export * from './angular';
-
-// React
-export * from './react';
-
-// Vue
-export * from './vue';
+export {};

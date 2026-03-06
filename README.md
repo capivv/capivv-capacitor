@@ -238,6 +238,28 @@ Get all active entitlements for the current user.
 | purchaseCompleted    | Fired when a purchase completes            |
 | purchaseFailed       | Fired when a purchase fails                |
 
+## Paywall Components
+
+Pre-built paywall components are available as companion packages:
+
+- **React**: `npm install @capivv/capacitor-react`
+- **Vue**: `npm install @capivv/capacitor-vue`
+- **Angular**: `npm install @capivv/capacitor-angular`
+
+```tsx
+// React example
+import { CapivvPaywall } from '@capivv/capacitor-react';
+
+<CapivvPaywall
+  offeringId="default"
+  title="Unlock Premium"
+  features={['Unlimited access', 'No ads', 'Priority support']}
+  showRestoreButton={true}
+  onPurchaseComplete={(result) => console.log('Purchased!', result)}
+  onDismiss={() => setShowPaywall(false)}
+/>
+```
+
 ## Integration with Ionic
 
 ### Angular

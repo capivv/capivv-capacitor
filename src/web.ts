@@ -21,12 +21,12 @@ import type { TemplateDefinition, TemplateLoadResult } from './templates/types';
  * Stripe integration can be added for web purchases.
  */
 export class CapivvWeb extends WebPlugin implements CapivvPlugin {
-  private config: CapivvConfig | null = null;
+  private capivvConfig: CapivvConfig | null = null;
   private userId: string | null = null;
-  private apiUrl: string = 'https://api.capivv.com';
+  private apiUrl: string = 'https://app.capivv.com';
 
   async configure(config: CapivvConfig): Promise<void> {
-    this.config = config;
+    this.capivvConfig = config;
     if (config.apiUrl) {
       this.apiUrl = config.apiUrl;
     }
@@ -39,15 +39,17 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     this.ensureConfigured();
     this.userId = options.userId;
 
-    const response = await this.apiRequest('POST', `/v1/users/${options.userId}/login`, {
+    const response = await this.apiRequest('POST', `/v1/sdk/users`, {
+      external_id: options.userId,
       attributes: options.attributes,
     });
 
+    const data = response as any;
     return {
       userId: options.userId,
-      entitlements: response.entitlements || [],
-      originalPurchaseDate: response.original_purchase_date,
-      latestPurchaseDate: response.latest_purchase_date,
+      entitlements: data.entitlements || [],
+      originalPurchaseDate: data.original_purchase_date,
+      latestPurchaseDate: data.latest_purchase_date,
     };
   }
 
@@ -59,11 +61,12 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     this.ensureConfigured();
     this.ensureIdentified();
 
-    const response = await this.apiRequest('GET', `/v1/users/${this.userId}/entitlements`);
+    const response = await this.apiRequest('GET', `/v1/sdk/users/${this.userId}/entitlements`);
 
+    const data = response as any;
     return {
       userId: this.userId!,
-      entitlements: response.entitlements || [],
+      entitlements: data.entitlements || [],
     };
   }
 
@@ -75,10 +78,12 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
   async getOfferings(): Promise<{ offerings: Offering[] }> {
     this.ensureConfigured();
 
-    const response = await this.apiRequest('GET', '/v1/offerings');
+    const params = this.userId ? `?user_id=${encodeURIComponent(this.userId)}` : '';
+    const response = await this.apiRequest('GET', `/v1/sdk/offerings${params}`);
 
+    const data = response as any;
     return {
-      offerings: (response.offerings || []).map(this.mapOffering),
+      offerings: (data.offerings || []).map(this.mapOffering),
     };
   }
 
@@ -151,10 +156,11 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
 
     // Web doesn't have local purchases to restore
     // Just fetch current entitlements from server
-    const response = await this.apiRequest('GET', `/v1/users/${this.userId}/entitlements`);
+    const response = await this.apiRequest('GET', `/v1/sdk/users/${this.userId}/entitlements`);
 
+    const restoreData = response as any;
     return {
-      entitlements: response.entitlements || [],
+      entitlements: restoreData.entitlements || [],
     };
   }
 
@@ -164,8 +170,9 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     this.ensureConfigured();
     this.ensureIdentified();
 
-    const response = await this.apiRequest('GET', `/v1/users/${this.userId}/entitlements`);
-    const entitlements: Entitlement[] = response.entitlements || [];
+    const response = await this.apiRequest('GET', `/v1/sdk/users/${this.userId}/entitlements`);
+    const checkData = response as any;
+    const entitlements: Entitlement[] = checkData.entitlements || [];
 
     const entitlement = entitlements.find((e) => e.identifier === options.entitlementIdentifier);
 
@@ -179,10 +186,10 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     this.ensureConfigured();
     this.ensureIdentified();
 
-    const response = await this.apiRequest('GET', `/v1/users/${this.userId}/entitlements`);
-
+    const response = await this.apiRequest('GET', `/v1/sdk/users/${this.userId}/entitlements`);
+    const entData = response as any;
     return {
-      entitlements: response.entitlements || [],
+      entitlements: entData.entitlements || [],
     };
   }
 
@@ -219,7 +226,7 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
         cacheTtlSeconds: data.cache_ttl_seconds as number | undefined,
       };
     } catch (e) {
-      if (this.config?.debug) {
+      if (this.capivvConfig?.debug) {
         console.log(`[Capivv] Template not available for ${identifier}:`, e);
       }
       // Return empty result for graceful fallback
@@ -253,7 +260,7 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
   // Helper methods
 
   private ensureConfigured(): void {
-    if (!this.config) {
+    if (!this.capivvConfig) {
       throw new Error('Capivv not configured. Call configure() first.');
     }
   }
@@ -268,7 +275,7 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     const url = `${this.apiUrl}${path}`;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      'X-Capivv-Api-Key': this.config!.apiKey,
+      'X-Capivv-Api-Key': this.capivvConfig!.apiKey,
     };
 
     const options: RequestInit = {
@@ -291,20 +298,31 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
   }
 
   private mapOffering(offering: Record<string, unknown>): Offering {
+    // API returns packages with nested product; flatten to products array
+    const packages = (offering.packages as Record<string, unknown>[]) || [];
+    const products = packages.map((pkg) => {
+      const product = (pkg.product as Record<string, unknown>) || {};
+      return {
+        identifier: (product.external_id as string) || (pkg.identifier as string),
+        title: (product.display_name as string) || '',
+        description: (product.description as string) || '',
+        priceString: pkg.price ? `${(pkg.price as Record<string, unknown>).formatted || ''}` : '',
+        priceAmountMicros: pkg.price
+          ? ((pkg.price as Record<string, unknown>).amount_cents as number || 0) * 10000
+          : 0,
+        currencyCode: pkg.price
+          ? ((pkg.price as Record<string, unknown>).currency as string) || 'USD'
+          : 'USD',
+        productType: (pkg.package_type as ProductType) || ('subscription' as ProductType),
+        subscriptionPeriod: undefined as string | undefined,
+        trialPeriod: undefined as string | undefined,
+      };
+    });
+
     return {
       identifier: offering.identifier as string,
-      description: offering.description as string | undefined,
-      products: ((offering.products as Record<string, unknown>[]) || []).map((p) => ({
-        identifier: p.identifier as string,
-        title: p.title as string,
-        description: p.description as string,
-        priceString: p.price_string as string,
-        priceAmountMicros: p.price_amount_micros as number,
-        currencyCode: p.currency_code as string,
-        productType: p.product_type as ProductType,
-        subscriptionPeriod: p.subscription_period as string | undefined,
-        trialPeriod: p.trial_period as string | undefined,
-      })),
+      description: (offering.display_name as string) || (offering.description as string | undefined),
+      products,
       metadata: offering.metadata as Record<string, unknown> | undefined,
     };
   }

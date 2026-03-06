@@ -11,21 +11,21 @@ describe('Capivv Web Implementation', () => {
 
   describe('API Client', () => {
     it('should format API URL correctly', () => {
-      const baseUrl = 'https://api.capivv.com';
-      const endpoint = '/v1/users/123';
+      const baseUrl = 'https://app.capivv.com';
+      const endpoint = '/v1/sdk/offerings';
       const fullUrl = `${baseUrl}${endpoint}`;
 
-      expect(fullUrl).toBe('https://api.capivv.com/v1/users/123');
+      expect(fullUrl).toBe('https://app.capivv.com/v1/sdk/offerings');
     });
 
     it('should handle API key header format', () => {
-      const apiKey = 'capivv_pk_test_123';
+      const apiKey = 'pk_live_abc123def456';
       const headers = {
-        'Authorization': `Bearer ${apiKey}`,
+        'X-Capivv-Api-Key': apiKey,
         'Content-Type': 'application/json',
       };
 
-      expect(headers['Authorization']).toBe('Bearer capivv_pk_test_123');
+      expect(headers['X-Capivv-Api-Key']).toBe('pk_live_abc123def456');
     });
   });
 
