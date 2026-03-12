@@ -17,8 +17,9 @@ import type { TemplateDefinition, TemplateLoadResult } from './templates/types';
 
 /**
  * Web implementation of the Capivv plugin.
- * Uses the Capivv REST API directly for web platforms.
- * Stripe integration can be added for web purchases.
+ * Uses the Capivv REST API for entitlements, offerings, and user management.
+ * Purchases on web use Stripe Checkout via the Capivv API.
+ * Native purchases use StoreKit 2 (iOS) and Google Play Billing (Android).
  */
 export class CapivvWeb extends WebPlugin implements CapivvPlugin {
   private capivvConfig: CapivvConfig | null = null;
@@ -71,7 +72,8 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
   }
 
   async isBillingSupported(): Promise<{ isSupported: boolean }> {
-    // Web platform always supports billing via Stripe
+    // Web purchases are supported via Stripe Checkout (requires Stripe integration
+    // configured in the Capivv dashboard).
     return { isSupported: true };
   }
 
@@ -133,21 +135,97 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     this.ensureConfigured();
     this.ensureIdentified();
 
-    // For web, we would integrate with Stripe Checkout here
-    // This is a placeholder that returns an error suggesting native platforms
-    console.warn(
-      '[Capivv] Web purchases require Stripe integration. Configure Stripe in your Capivv dashboard.',
-    );
+    // Web purchases go through Stripe Checkout via the Capivv API.
+    // 1. Create a Stripe Checkout Session on the backend
+    // 2. Redirect the user to Stripe's hosted checkout page
+    // 3. After payment, user is redirected back to success_url with session_id
+    // 4. Call verifyStripeSession() on the success page to finalize
 
-    // TODO: Implement Stripe Checkout integration
-    // 1. Create checkout session via Capivv API
-    // 2. Redirect to Stripe Checkout
-    // 3. Handle success/cancel callbacks
+    const successUrl = typeof window !== 'undefined'
+      ? `${window.location.origin}/purchase/success`
+      : 'https://localhost/purchase/success';
+    const cancelUrl = typeof window !== 'undefined'
+      ? window.location.href
+      : 'https://localhost/purchase/cancel';
 
-    return {
-      success: false,
-      error: 'Web purchases not yet implemented. Use iOS or Android for native purchases.',
-    };
+    try {
+      const response = await this.apiRequest('POST', '/v1/sdk/stripe/checkout-session', {
+        userId: this.userId,
+        productId: options.productIdentifier,
+        successUrl,
+        cancelUrl,
+      });
+
+      const data = response as { sessionId: string; url: string };
+
+      // Redirect to Stripe Checkout
+      if (typeof window !== 'undefined' && data.url) {
+        window.location.href = data.url;
+      }
+
+      // This return won't be reached due to redirect, but satisfies the type
+      return {
+        success: true,
+        transaction: {
+          transactionId: data.sessionId,
+          productIdentifier: options.productIdentifier,
+          purchaseDate: new Date().toISOString(),
+          state: PurchaseState.PURCHASED,
+          isAcknowledged: false,
+        },
+      };
+    } catch (e) {
+      const errorMsg = e instanceof Error ? e.message : 'Purchase failed';
+      this.notifyListeners('purchaseFailed', {
+        productIdentifier: options.productIdentifier,
+        error: errorMsg,
+      });
+      return {
+        success: false,
+        error: errorMsg,
+      };
+    }
+  }
+
+  /**
+   * Verify a Stripe Checkout session after redirect.
+   * Call this on your success page with the session_id from the URL query params.
+   */
+  async verifyStripeSession(sessionId: string): Promise<PurchaseResult> {
+    this.ensureConfigured();
+
+    try {
+      const response = await this.apiRequest('POST', '/v1/sdk/stripe/verify-session', {
+        sessionId,
+      });
+
+      const data = response as { success: boolean; entitlements: Entitlement[]; error?: string };
+
+      if (data.success) {
+        this.notifyListeners('purchaseCompleted', {
+          transaction: {
+            transactionId: sessionId,
+            productIdentifier: 'stripe_checkout',
+            purchaseDate: new Date().toISOString(),
+            state: PurchaseState.PURCHASED,
+            isAcknowledged: true,
+          },
+        });
+        this.notifyListeners('entitlementsUpdated', {
+          entitlements: data.entitlements,
+        });
+      }
+
+      return {
+        success: data.success,
+        error: data.error,
+      };
+    } catch (e) {
+      return {
+        success: false,
+        error: e instanceof Error ? e.message : 'Verification failed',
+      };
+    }
   }
 
   async restorePurchases(): Promise<{ entitlements: Entitlement[] }> {
@@ -199,11 +277,33 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
   }
 
   async manageSubscriptions(): Promise<void> {
-    // For web, we could redirect to a customer portal
-    // For now, log a warning
-    console.warn(
-      '[Capivv] Subscription management on web requires Stripe Customer Portal integration.',
-    );
+    this.ensureConfigured();
+    this.ensureIdentified();
+
+    // On web, open Stripe's Customer Portal where users can manage their
+    // subscriptions, update payment methods, and cancel.
+    try {
+      const returnUrl = typeof window !== 'undefined'
+        ? window.location.href
+        : 'https://localhost';
+
+      const response = await this.apiRequest('POST', '/v1/sdk/stripe/customer-portal', {
+        userId: this.userId,
+        returnUrl,
+      });
+
+      const data = response as { url: string };
+
+      if (typeof window !== 'undefined' && data.url) {
+        window.location.href = data.url;
+      }
+    } catch (e) {
+      // If Stripe portal is not available (no customer ID yet), fall back to
+      // Apple/Google subscription management pages
+      if (typeof window !== 'undefined') {
+        window.open('https://apps.apple.com/account/subscriptions', '_blank');
+      }
+    }
   }
 
   /**
