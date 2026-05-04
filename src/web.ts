@@ -11,6 +11,7 @@ import type {
   PurchaseResult,
   Entitlement,
   EntitlementCheckResult,
+  PaywallResult,
 } from './definitions';
 import { PurchaseState } from './definitions';
 import type { TemplateDefinition, TemplateLoadResult } from './templates/types';
@@ -304,6 +305,22 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
         window.open('https://apps.apple.com/account/subscriptions', '_blank');
       }
     }
+  }
+
+  /**
+   * Public `getPaywall` (v0.3.0) — fetch a paywall's declarative template
+   * by identifier. Thin wrapper over the existing `getPaywallTemplate`
+   * helper but exposed on the public `CapivvPlugin` interface so
+   * TypeScript-typed callers can use it.
+   */
+  async getPaywall(options: { identifier: string }): Promise<PaywallResult> {
+    const result = await this.getPaywallTemplate(options.identifier);
+    return {
+      template: result.template,
+      version: result.version,
+      updatedAt: result.updatedAt,
+      cacheTtlSeconds: result.cacheTtlSeconds,
+    };
   }
 
   /**

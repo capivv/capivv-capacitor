@@ -15,6 +15,7 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getUserInfo", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "isBillingSupported", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getOfferings", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getPaywall", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getProduct", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getProducts", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "purchase", returnType: CAPPluginReturnPromise),
@@ -26,7 +27,7 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
     ]
 
     private var apiKey: String?
-    private var apiUrl: String = "https://api.capivv.com"
+    private var apiUrl: String = "https://app.capivv.com"
     private var userId: String?
     private var debug: Bool = false
     private var transactionObserver: Task<Void, Never>?
@@ -179,6 +180,57 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                 call.resolve(["offerings": enrichedOfferings])
             } catch {
                 call.reject("Failed to get offerings: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Fetch a paywall's declarative template from Capivv. Pure HTTP — no
+    /// StoreKit involvement. Pairs with `<DynamicPaywall>` in
+    /// `@capivv/capacitor-react` for OTA-updateable paywall configs.
+    @objc func getPaywall(_ call: CAPPluginCall) {
+        guard apiKey != nil else {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+
+        guard let identifier = call.getString("identifier") else {
+            call.reject("identifier is required")
+            return
+        }
+
+        let encodedIdentifier = identifier.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? identifier
+
+        Task {
+            do {
+                let response = try await apiRequest(
+                    method: "GET",
+                    path: "/v1/paywalls/by-identifier/\(encodedIdentifier)/template"
+                )
+
+                let template = response["template"] ?? NSNull()
+                let version = response["version"] as? String ?? "1.0.0"
+                let updatedAt = response["updated_at"] as? String
+                    ?? ISO8601DateFormatter().string(from: Date())
+                var result: [String: Any] = [
+                    "template": template,
+                    "version": version,
+                    "updatedAt": updatedAt
+                ]
+                if let ttl = response["cache_ttl_seconds"] as? Int {
+                    result["cacheTtlSeconds"] = ttl
+                }
+                call.resolve(result)
+            } catch let error as NSError where error.code == 404 {
+                // Graceful fallback — no template configured for this id.
+                call.resolve([
+                    "template": NSNull(),
+                    "version": "0.0.0",
+                    "updatedAt": ISO8601DateFormatter().string(from: Date())
+                ])
+            } catch {
+                call.reject("Failed to fetch paywall: \(error.localizedDescription)")
             }
         }
     }

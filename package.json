@@ -1,6 +1,6 @@
 {
   "name": "@capivv/capacitor-sdk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Capacitor plugin for Capivv - Revenue as Code for subscription management",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",

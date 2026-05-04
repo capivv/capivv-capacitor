@@ -83,4 +83,56 @@ describe('Capivv Web Implementation', () => {
       expect(Object.keys(attrs).length).toBe(0);
     });
   });
+
+  describe('getPaywall (v0.3.0)', () => {
+    it('should call /v1/paywalls/by-identifier/:id/template and unwrap the response', async () => {
+      const { CapivvWeb } = await import('../web');
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          template: { components: [{ type: 'headline', props: { text: 'Pro' } }] },
+          version: '2.0.0',
+          updated_at: '2026-05-04T10:00:00Z',
+          cache_ttl_seconds: 300,
+        }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const sdk = new CapivvWeb();
+      await sdk.configure({ apiKey: 'pk_test_abc' });
+      const result = await sdk.getPaywall({ identifier: 'pro' });
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const [url] = fetchMock.mock.calls[0];
+      expect(url).toBe(
+        'https://app.capivv.com/v1/paywalls/by-identifier/pro/template'
+      );
+      expect(result.template).toEqual({
+        components: [{ type: 'headline', props: { text: 'Pro' } }],
+      });
+      expect(result.version).toBe('2.0.0');
+      expect(result.cacheTtlSeconds).toBe(300);
+
+      vi.unstubAllGlobals();
+    });
+
+    it('should return template:null on 404 instead of throwing', async () => {
+      const { CapivvWeb } = await import('../web');
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        text: async () => 'Paywall not found',
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const sdk = new CapivvWeb();
+      await sdk.configure({ apiKey: 'pk_test_abc' });
+      const result = await sdk.getPaywall({ identifier: 'nonexistent' });
+
+      expect(result.template).toBeNull();
+      expect(result.version).toBe('0.0.0');
+
+      vi.unstubAllGlobals();
+    });
+  });
 });

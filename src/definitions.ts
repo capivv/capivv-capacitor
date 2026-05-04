@@ -1,4 +1,5 @@
 import type { PluginListenerHandle } from '@capacitor/core';
+import type { TemplateDefinition } from './templates/types';
 
 /**
  * Product type for purchases
@@ -139,6 +140,27 @@ export interface EntitlementCheckResult {
 }
 
 /**
+ * Result of fetching a paywall config from Capivv. The `template` is the
+ * declarative `TemplateDefinition` that `<DynamicPaywall>` renders.
+ *
+ * `template` is null when no template has been configured for the
+ * paywall identifier (caller should fall back to a hardcoded screen).
+ */
+export interface PaywallResult {
+  /** Declarative paywall config; pass to `<DynamicPaywall template={...}>`. */
+  template: TemplateDefinition | null;
+  /** Template version, useful for cache invalidation. */
+  version: string;
+  /** ISO-8601 timestamp of the last update. */
+  updatedAt: string;
+  /**
+   * Suggested cache TTL in seconds. Clients can cache the result this
+   * long before re-fetching. Undefined means no recommended TTL.
+   */
+  cacheTtlSeconds?: number;
+}
+
+/**
  * Result of a purchase operation
  */
 export interface PurchaseResult {
@@ -226,6 +248,28 @@ export interface CapivvPlugin {
    * @returns Promise with list of offerings
    */
   getOfferings(): Promise<{ offerings: Offering[] }>;
+
+  /**
+   * Fetch a paywall's declarative `TemplateDefinition` by identifier.
+   *
+   * Pair this with `<DynamicPaywall template={result.template} />` from
+   * `@capivv/capacitor-react` to render a paywall whose copy, layout,
+   * and theme can be edited from the Capivv dashboard / MCP without
+   * shipping a new app build.
+   *
+   * Returns `template: null` if no template is configured for the
+   * identifier (caller should fall back to a hardcoded screen).
+   * Throws if the SDK isn't configured or the network call fails.
+   *
+   * @example
+   * ```ts
+   * const { template } = await Capivv.getPaywall({ identifier: 'pro' });
+   * if (template) {
+   *   return <DynamicPaywall template={template} offerings={offerings} ... />;
+   * }
+   * ```
+   */
+  getPaywall(options: { identifier: string }): Promise<PaywallResult>;
 
   /**
    * Get a specific product by identifier.

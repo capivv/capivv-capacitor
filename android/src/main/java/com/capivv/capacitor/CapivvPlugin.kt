@@ -22,7 +22,7 @@ import kotlin.coroutines.suspendCoroutine
 class CapivvPlugin : Plugin() {
 
     private var apiKey: String? = null
-    private var apiUrl: String = "https://api.capivv.com"
+    private var apiUrl: String = "https://app.capivv.com"
     private var userId: String? = null
     private var debug: Boolean = false
 
@@ -228,6 +228,63 @@ class CapivvPlugin : Plugin() {
                 })
             } catch (e: Exception) {
                 call.reject("Failed to get offerings: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Fetch a paywall's declarative template from Capivv. Pure HTTP — no
+     * Google Play Billing involvement. Pairs with `<DynamicPaywall>` in
+     * `@capivv/capacitor-react` for OTA-updateable paywall configs.
+     */
+    @PluginMethod
+    fun getPaywall(call: PluginCall) {
+        if (apiKey == null) {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+
+        val identifier = call.getString("identifier")
+        if (identifier == null) {
+            call.reject("identifier is required")
+            return
+        }
+
+        val encodedIdentifier = java.net.URLEncoder.encode(identifier, "UTF-8")
+
+        scope.launch {
+            try {
+                val response = apiRequest(
+                    "GET",
+                    "/v1/paywalls/by-identifier/$encodedIdentifier/template"
+                )
+                val result = JSObject()
+                if (response.isNull("template")) {
+                    result.put("template", JSONObject.NULL)
+                } else {
+                    result.put("template", response.opt("template"))
+                }
+                result.put("version", response.optString("version", "1.0.0"))
+                result.put(
+                    "updatedAt",
+                    response.optString("updated_at", java.time.Instant.now().toString())
+                )
+                if (response.has("cache_ttl_seconds") && !response.isNull("cache_ttl_seconds")) {
+                    result.put("cacheTtlSeconds", response.getInt("cache_ttl_seconds"))
+                }
+                call.resolve(result)
+            } catch (e: Exception) {
+                // 404 → graceful empty result; everything else → reject.
+                if (e.message?.contains("404") == true) {
+                    val fallback = JSObject().apply {
+                        put("template", JSONObject.NULL)
+                        put("version", "0.0.0")
+                        put("updatedAt", java.time.Instant.now().toString())
+                    }
+                    call.resolve(fallback)
+                } else {
+                    call.reject("Failed to fetch paywall: ${e.message}")
+                }
             }
         }
     }
