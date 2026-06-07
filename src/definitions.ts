@@ -127,6 +127,72 @@ export interface UserInfo {
   originalPurchaseDate?: string;
   /** Latest purchase date */
   latestPurchaseDate?: string;
+  /**
+   * v0.5.35 — variant assignments for every running experiment the user
+   * has been bucketed into. Issue #14. Populated on every getUserInfo()
+   * / identify() so apps can branch on assignment at boot without a
+   * per-experiment lookup. Empty array if no running experiments touch
+   * this user. For an explicit per-experiment lookup (which also
+   * lazily creates the assignment on first call), use
+   * `Capivv.getVariantForExperiment({ experimentId })`.
+   */
+  experimentAssignments?: ExperimentAssignment[];
+}
+
+/**
+ * v0.5.35 — a single variant assignment. Issue #14.
+ * v0.5.40 — `config` added for #18 Primitive 1
+ * (variant.config.product_override). Object shape; `{}` when the
+ * variant has no custom config. Read e.g. `config.product_override?.external_id`
+ * to branch app behavior per arm without an extra request.
+ */
+export interface ExperimentAssignment {
+  experimentId: string;
+  experimentName: string;
+  variantId: string;
+  variantName: string;
+  isControl: boolean;
+  assignedAt: string;
+  config: Record<string, unknown>;
+}
+
+/**
+ * v0.5.35 — result of a per-experiment variant lookup. Issue #14.
+ *
+ * When the experiment isn't running (draft / paused / completed), every
+ * field below variantId is null — distinguishes "no arm yet" from "no
+ * experiment found" (which throws 404 via CapivvApiError instead).
+ */
+export interface VariantAssignment {
+  experimentId: string;
+  variantId: string | null;
+  variantName: string | null;
+  isControl: boolean | null;
+  /**
+   * v0.5.40 — the variant's `config` JSON. Issue #18 Primitive 1. `null`
+   * only when the experiment isn't running. Read `config.product_override?.external_id`
+   * to assign different Apple SKUs per arm (the pricing-A/B pattern), or
+   * any other custom key the experiment author wrote at create time.
+   * For a pre-resolved product id, see `Capivv.getAssignedProductForExperiment`.
+   */
+  config: Record<string, unknown> | null;
+}
+
+/**
+ * v0.5.40 — result of `Capivv.getAssignedProductForExperiment`. Issue #18
+ * Primitive 1. Convenience helper that resolves `variant.config.product_override`
+ * to a concrete product identifier the app can pass to `Capivv.purchase`.
+ *
+ * `productId` is the override's `external_id` when the variant has one,
+ * otherwise the `fallbackProductId` the caller supplied. `source`
+ * disambiguates which path was taken so the app can log it for analytics.
+ */
+export interface AssignedProduct {
+  productId: string;
+  source: 'variant_override' | 'fallback';
+  variantId: string | null;
+  variantName: string | null;
+  isControl: boolean | null;
 }
 
 /**
@@ -137,6 +203,31 @@ export interface EntitlementCheckResult {
   hasAccess: boolean;
   /** The entitlement if found */
   entitlement?: Entitlement;
+}
+
+/**
+ * Error thrown by Capivv SDK API calls when the backend returns a
+ * non-success HTTP status. Has a `status` field so callers can branch
+ * on auth vs server errors instead of pattern-matching on the message.
+ *
+ * v0.5.19 — added so `Capivv.getPaywall(...)` and friends can be more
+ * discriminating about which errors deserve a `template: null` graceful
+ * fallback (only 404) vs which should propagate (401/403/5xx). Web
+ * callers can `import { CapivvApiError } from '@capivv/capacitor-sdk'`
+ * and `instanceof` check.
+ */
+export class CapivvApiError extends Error {
+  public readonly status: number;
+  public readonly body: string;
+
+  constructor(status: number, body: string) {
+    super(`Capivv API error (${status}): ${body}`);
+    this.name = 'CapivvApiError';
+    this.status = status;
+    this.body = body;
+    // Preserve prototype chain for `instanceof` after transpilation.
+    Object.setPrototypeOf(this, CapivvApiError.prototype);
+  }
 }
 
 /**
@@ -158,6 +249,27 @@ export interface PaywallResult {
    * long before re-fetching. Undefined means no recommended TTL.
    */
   cacheTtlSeconds?: number;
+  /**
+   * v0.5.37 — issue #16. Variants that were merged into `template` for
+   * this user. Empty when the SDK isn't identified at fetch time or no
+   * running experiment is scoped to this paywall. Apps can log these
+   * to their own analytics to track which arm rendered. The user is
+   * already in the assignment table; this field is just the visible
+   * surface for app-side telemetry.
+   */
+  appliedVariants?: AppliedVariant[];
+}
+
+/**
+ * v0.5.37 — issue #16. A single variant whose config was merged into a
+ * paywall template.
+ */
+export interface AppliedVariant {
+  experimentId: string;
+  experimentName: string;
+  variantId: string;
+  variantName: string;
+  isControl: boolean;
 }
 
 /**
@@ -233,6 +345,58 @@ export interface CapivvPlugin {
    * @returns Promise with user information
    */
   getUserInfo(): Promise<UserInfo>;
+
+  /**
+   * v0.5.35 — fetch which variant a user is in for a given experiment.
+   * Issue #14.
+   *
+   * On first call for a (user, experiment) pair the server lazily
+   * creates a deterministic bucket assignment honoring the experiment's
+   * variant traffic_percent split. Subsequent calls return the same
+   * variant — assignment is stable across SDK boots and even across
+   * `identify` re-runs (it's keyed on the user's external_id, not the
+   * internal app_user row).
+   *
+   * Returns `variantId: null` (still HTTP 200) if the experiment isn't
+   * running (draft / paused / completed). Throws 404 via CapivvApiError
+   * if the experiment doesn't exist. Throws if the SDK isn't
+   * configured or identified.
+   *
+   * For reading *all* current assignments at once (e.g. at boot, no
+   * server round-trip per experiment), read `userInfo.experimentAssignments`
+   * after `identify()` / `getUserInfo()` instead.
+   *
+   * @example
+   * ```ts
+   * const { variantName, isControl } = await Capivv.getVariantForExperiment({
+   *   experimentId: 'b410469c-7df5-45ba-acdb-c8fa4183aa23',
+   * });
+   * const defaultPlan = variantName === 'annual_default' ? 'annual' : 'monthly';
+   * ```
+   */
+  getVariantForExperiment(options: { experimentId: string }): Promise<VariantAssignment>;
+
+  /**
+   * v0.5.40 — issue #18 Primitive 1. Resolves which product the current
+   * user should be charged for a pricing-A/B experiment.
+   *
+   * Reads `config.product_override.external_id` from the assigned
+   * variant; falls back to `fallbackProductId` when the variant is the
+   * control, has no override set, or the experiment isn't running.
+   *
+   * @example
+   * ```ts
+   * const { productId } = await Capivv.getAssignedProductForExperiment({
+   *   experimentId: 'price-monthly-tier-test-v1',
+   *   fallbackProductId: 'com.interrrupt.app.pro.monthly',
+   * });
+   * await Capivv.purchase({ productIdentifier: productId });
+   * ```
+   */
+  getAssignedProductForExperiment(options: {
+    experimentId: string;
+    fallbackProductId: string;
+  }): Promise<AssignedProduct>;
 
   /**
    * Check if billing is supported on this device.

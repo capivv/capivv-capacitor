@@ -12,7 +12,11 @@ import type {
   Entitlement,
   EntitlementCheckResult,
   PaywallResult,
+  VariantAssignment,
+  ExperimentAssignment,
+  AssignedProduct,
 } from './definitions';
+import { CapivvApiError } from './definitions';
 import { PurchaseState } from './definitions';
 import type { TemplateDefinition, TemplateLoadResult } from './templates/types';
 
@@ -52,6 +56,9 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
       entitlements: data.entitlements || [],
       originalPurchaseDate: data.original_purchase_date,
       latestPurchaseDate: data.latest_purchase_date,
+      // v0.5.35 — issue #14. Server may omit the field for older deploys
+      // — treat absent as empty rather than undefined leaking through.
+      experimentAssignments: mapExperimentAssignments(data.experiment_assignments),
     };
   }
 
@@ -69,6 +76,64 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     return {
       userId: this.userId!,
       entitlements: data.entitlements || [],
+      // v0.5.35 — issue #14. Same backend bundles assignments under
+      // `experiment_assignments`; mapper handles snake_case → camel.
+      experimentAssignments: mapExperimentAssignments(data.experiment_assignments),
+    };
+  }
+
+  /**
+   * v0.5.35 — per-experiment variant lookup. Issue #14. See definitions.ts
+   * for full doc — server route is
+   * `GET /v1/sdk/users/:user_id/experiments/:experiment_id/variant`.
+   */
+  async getVariantForExperiment(options: { experimentId: string }): Promise<VariantAssignment> {
+    this.ensureConfigured();
+    this.ensureIdentified();
+
+    const response = await this.apiRequest(
+      'GET',
+      `/v1/sdk/users/${encodeURIComponent(this.userId!)}/experiments/${encodeURIComponent(
+        options.experimentId,
+      )}/variant`,
+    );
+
+    const data = response as any;
+    return {
+      experimentId: data.experiment_id,
+      variantId: data.variant_id ?? null,
+      variantName: data.variant_name ?? null,
+      isControl: data.is_control ?? null,
+      // v0.5.40 — issue #18 Primitive 1. Server returns the object as-is.
+      config: (data.config as Record<string, unknown> | null | undefined) ?? null,
+    };
+  }
+
+  /**
+   * v0.5.40 — issue #18 Primitive 1. See definitions.ts for full doc.
+   * Wraps getVariantForExperiment and resolves to the right product id.
+   */
+  async getAssignedProductForExperiment(options: {
+    experimentId: string;
+    fallbackProductId: string;
+  }): Promise<AssignedProduct> {
+    const va = await this.getVariantForExperiment({ experimentId: options.experimentId });
+    // The override convention: variant.config.product_override.external_id
+    // is the SKU the app should pass to Capivv.purchase. If absent (control
+    // arm, no override, or no running experiment), use the fallback.
+    const override = va.config?.product_override as
+      | { external_id?: string; product_id?: string }
+      | undefined;
+    const overrideId =
+      typeof override?.external_id === 'string' && override.external_id.length > 0
+        ? override.external_id
+        : null;
+    return {
+      productId: overrideId ?? options.fallbackProductId,
+      source: overrideId ? 'variant_override' : 'fallback',
+      variantId: va.variantId,
+      variantName: va.variantName,
+      isControl: va.isControl,
     };
   }
 
@@ -320,19 +385,47 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
       version: result.version,
       updatedAt: result.updatedAt,
       cacheTtlSeconds: result.cacheTtlSeconds,
+      // v0.5.37 — issue #16. Surface merged variants for app-side analytics.
+      appliedVariants: result.appliedVariants ?? [],
     };
   }
 
   /**
    * Get a paywall template by identifier for OTA updates.
+   *
+   * Discrimination of failure modes (v0.5.19 fix — customer audit
+   * caught that pre-fix this caught everything and silently returned
+   * `template: null`, indistinguishable between "no template
+   * configured", "auth failed", "server down", and "network down"):
+   *
+   *   * 404 — clean "no template configured" / "paywall not found".
+   *     Returns `{ template: null, ... }`. This is the only case
+   *     where falling back to a hardcoded screen is correct.
+   *   * 401 / 403 — auth issue (wrong key, key for another tenant,
+   *     publishable key trying to read a draft paywall, etc.).
+   *     Re-thrown so the caller can show the real error.
+   *   * 5xx — backend error. Re-thrown.
+   *   * Network failure — re-thrown (not a CapivvApiError).
+   *
+   * In all non-404 error cases we ALSO log to console at warn level
+   * (not just when `debug: true`), so dev-mode tracing is available
+   * without flipping a flag. The customer's symptom — `template:
+   * null` for hours with no warning anywhere — was caused by this
+   * catch swallowing 401s silently.
    */
   async getPaywallTemplate(identifier: string): Promise<TemplateLoadResult> {
     this.ensureConfigured();
 
+    // v0.5.37 — issue #16. Pass user_id when identified so the server can
+    // merge active experiment variant.config into the returned template.
+    // Without it, the server falls back to the raw template (pre-v0.5.37
+    // behavior), so this is fully backward compatible.
+    const userQuery = this.userId ? `?user_id=${encodeURIComponent(this.userId)}` : '';
+
     try {
       const response = await this.apiRequest(
         'GET',
-        `/v1/paywalls/by-identifier/${identifier}/template`
+        `/v1/paywalls/by-identifier/${identifier}/template${userQuery}`
       );
 
       const data = response as Record<string, unknown>;
@@ -341,17 +434,34 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
         version: (data.version as string) || '1.0.0',
         updatedAt: (data.updated_at as string) || new Date().toISOString(),
         cacheTtlSeconds: data.cache_ttl_seconds as number | undefined,
+        // v0.5.37 — surface which experiment variants were merged so apps
+        // can also log them to their own analytics.
+        appliedVariants: Array.isArray(data.applied_variants)
+          ? (data.applied_variants as Array<Record<string, unknown>>).map((v) => ({
+              experimentId: v.experiment_id as string,
+              experimentName: v.experiment_name as string,
+              variantId: v.variant_id as string,
+              variantName: v.variant_name as string,
+              isControl: !!v.is_control,
+            }))
+          : [],
       };
     } catch (e) {
-      if (this.capivvConfig?.debug) {
-        console.log(`[Capivv] Template not available for ${identifier}:`, e);
+      if (e instanceof CapivvApiError && e.status === 404) {
+        if (this.capivvConfig?.debug) {
+          console.log(`[Capivv] No template configured for paywall '${identifier}' (404)`);
+        }
+        return {
+          template: null,
+          version: '0.0.0',
+          updatedAt: new Date().toISOString(),
+        };
       }
-      // Return empty result for graceful fallback
-      return {
-        template: null,
-        version: '0.0.0',
-        updatedAt: new Date().toISOString(),
-      };
+      console.warn(
+        `[Capivv] Failed to fetch paywall template '${identifier}':`,
+        e instanceof Error ? `${e.name}: ${e.message}` : e,
+      );
+      throw e;
     }
   }
 
@@ -408,7 +518,10 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
 
     if (!response.ok) {
       const error = await response.text();
-      throw new Error(`API error (${response.status}): ${error}`);
+      // Throw a typed error with the status code so callers (e.g.
+      // `getPaywallTemplate`) can discriminate 404 → graceful fallback
+      // from 401/5xx → real failure that the agent should surface.
+      throw new CapivvApiError(response.status, error);
     }
 
     return response.json();
@@ -443,4 +556,25 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
       metadata: offering.metadata as Record<string, unknown> | undefined,
     };
   }
+}
+
+/**
+ * v0.5.35 — issue #14. Server returns snake_case; SDK exposes camelCase.
+ * Treat missing/null/non-array as empty so older server deploys don't
+ * crash newer SDKs and vice versa.
+ */
+function mapExperimentAssignments(raw: unknown): ExperimentAssignment[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((r: any) => ({
+    experimentId: r.experiment_id,
+    experimentName: r.experiment_name,
+    variantId: r.variant_id,
+    variantName: r.variant_name,
+    isControl: !!r.is_control,
+    assignedAt: r.assigned_at,
+    // v0.5.40 — issue #18 Primitive 1. Server returns object; coerce
+    // missing/null to {} so consumers can always read `.product_override`
+    // without null checks.
+    config: (r.config && typeof r.config === 'object' ? r.config : {}) as Record<string, unknown>,
+  }));
 }

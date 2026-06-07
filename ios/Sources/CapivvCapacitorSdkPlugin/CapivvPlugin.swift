@@ -73,21 +73,26 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         self.userId = userId
-        let attributes = call.getObject("attributes") ?? [:]
-
+        // V0.5.21 — hit the canonical SDK endpoint POST /v1/sdk/users
+        // with `{ external_id }`. Pre-fix the iOS plugin POSTed to
+        // /v1/users/{id}/login (which doesn't exist on the server) and
+        // every Capivv.identify() call returned a 404 the JS bridge
+        // swallowed silently. Server handler:
+        // crates/capivv-api/src/routes/sdk/mod.rs::create_or_get_user.
         Task {
             do {
                 let response = try await apiRequest(
                     method: "POST",
-                    path: "/v1/users/\(userId)/login",
-                    body: ["attributes": attributes]
+                    path: "/v1/sdk/users",
+                    body: ["external_id": userId]
                 )
 
+                let user = response["user"] as? [String: Any]
                 call.resolve([
                     "userId": userId,
                     "entitlements": response["entitlements"] ?? [],
-                    "originalPurchaseDate": response["original_purchase_date"] ?? NSNull(),
-                    "latestPurchaseDate": response["latest_purchase_date"] ?? NSNull()
+                    "originalPurchaseDate": user?["first_seen_at"] ?? NSNull(),
+                    "latestPurchaseDate": user?["last_seen_at"] ?? NSNull()
                 ])
             } catch {
                 call.reject("Failed to identify user: \(error.localizedDescription)")
@@ -110,7 +115,7 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
             do {
                 let response = try await apiRequest(
                     method: "GET",
-                    path: "/v1/users/\(userId)/entitlements"
+                    path: "/v1/sdk/users/\(userId)/entitlements"
                 )
 
                 call.resolve([
@@ -141,11 +146,22 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
+        // V0.5.21 — hit /v1/sdk/offerings?user_id=<id>, the canonical
+        // SDK surface accepting publishable keys. Pre-fix called
+        // /v1/offerings (404) and silently returned an empty paywall
+        // — the customer's "Failed to get offerings:" with empty colon
+        // came from this 404 with no body. Mirror the web layer:
+        // crates/capivv-api/src/routes/sdk/mod.rs::get_offerings.
+        let userIdParam: String = userId.flatMap {
+            $0.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
+                .map { "?user_id=\($0)" }
+        } ?? ""
+
         Task {
             do {
                 let response = try await apiRequest(
                     method: "GET",
-                    path: "/v1/offerings"
+                    path: "/v1/sdk/offerings\(userIdParam)"
                 )
 
                 guard let offerings = response["offerings"] as? [[String: Any]] else {
@@ -153,28 +169,79 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                     return
                 }
 
-                // Fetch StoreKit products for each offering
+                // V0.5.22 — parse the actual /v1/sdk/offerings response
+                // shape. Pre-fix iterated `offering["products"]` and
+                // pulled `store_product_id`, but the server returns
+                // `offering["packages"]` with `pkg["product"]` nested
+                // inside, and the product id field is `external_id`.
+                // Customer's symptom on v0.5.21 was a fully-rendered
+                // paywall with 0 packages — the guard fell through
+                // because `offering["products"]` was nil.
+                //
+                // Mirror @capivv/capacitor-sdk's `mapOffering` (web.ts)
+                // exactly, then optionally enrich each product with
+                // StoreKit data when the device can enumerate it. When
+                // StoreKit returns nothing (e.g. Apple's "first sub
+                // must ship with v1" hold — products READY_TO_SUBMIT
+                // but app v1.0 not yet submitted), the API-returned
+                // `pkg.price.formatted` survives as `priceString` so
+                // the user still sees real prices on device.
                 var enrichedOfferings: [[String: Any]] = []
 
                 for offering in offerings {
-                    guard let products = offering["products"] as? [[String: Any]] else {
-                        continue
-                    }
+                    let packages = (offering["packages"] as? [[String: Any]]) ?? []
 
-                    let productIds = products.compactMap { $0["store_product_id"] as? String }
-
-                    if #available(iOS 15.0, *) {
-                        let storeProducts = try await Product.products(for: Set(productIds))
-                        var enrichedProducts: [[String: Any]] = []
-
-                        for storeProduct in storeProducts {
-                            enrichedProducts.append(mapProduct(storeProduct))
+                    // Build the API-shape product list first. This is
+                    // what we return when StoreKit can't enumerate.
+                    var apiProducts: [[String: Any]] = []
+                    var storeIds: [String] = []
+                    var storeIdToIndex: [String: Int] = [:]
+                    for pkg in packages {
+                        let product = (pkg["product"] as? [String: Any]) ?? [:]
+                        let identifier = (product["external_id"] as? String)
+                            ?? (pkg["identifier"] as? String)
+                            ?? ""
+                        let priceObj = pkg["price"] as? [String: Any]
+                        let priceFormatted = priceObj?["formatted"] as? String ?? ""
+                        let amountCents = priceObj?["amount_cents"] as? Int ?? 0
+                        let currency = priceObj?["currency"] as? String ?? "USD"
+                        let entry: [String: Any] = [
+                            "identifier": identifier,
+                            "title": (product["display_name"] as? String) ?? "",
+                            "description": (product["description"] as? String) ?? "",
+                            "priceString": priceFormatted,
+                            "priceAmountMicros": amountCents * 10000,
+                            "currencyCode": currency,
+                            "productType": (pkg["package_type"] as? String) ?? "subscription"
+                        ]
+                        if !identifier.isEmpty {
+                            storeIdToIndex[identifier] = apiProducts.count
+                            storeIds.append(identifier)
                         }
-
-                        var enrichedOffering = offering
-                        enrichedOffering["products"] = enrichedProducts
-                        enrichedOfferings.append(enrichedOffering)
+                        apiProducts.append(entry)
                     }
+
+                    // Try StoreKit enrichment. We OVERWRITE the
+                    // matching apiProducts entry with the StoreKit one
+                    // because StoreKit's localized prices and trial
+                    // info are richer; products StoreKit can't find
+                    // keep their API-derived shape.
+                    if #available(iOS 15.0, *), !storeIds.isEmpty {
+                        do {
+                            let storeProducts = try await Product.products(for: Set(storeIds))
+                            for sk in storeProducts {
+                                if let idx = storeIdToIndex[sk.id] {
+                                    apiProducts[idx] = mapProduct(sk)
+                                }
+                            }
+                        } catch {
+                            log("StoreKit enrichment failed (using API prices): \(error.localizedDescription)")
+                        }
+                    }
+
+                    var enrichedOffering = offering
+                    enrichedOffering["products"] = apiProducts
+                    enrichedOfferings.append(enrichedOffering)
                 }
 
                 call.resolve(["offerings": enrichedOfferings])
@@ -400,7 +467,7 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                     // Fetch updated entitlements
                     let response = try await apiRequest(
                         method: "GET",
-                        path: "/v1/users/\(userId)/entitlements"
+                        path: "/v1/sdk/users/\(userId)/entitlements"
                     )
 
                     let entitlements = response["entitlements"] ?? []
@@ -434,7 +501,7 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
             do {
                 let response = try await apiRequest(
                     method: "GET",
-                    path: "/v1/users/\(userId)/entitlements"
+                    path: "/v1/sdk/users/\(userId)/entitlements"
                 )
 
                 guard let entitlements = response["entitlements"] as? [[String: Any]] else {
@@ -471,7 +538,7 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
             do {
                 let response = try await apiRequest(
                     method: "GET",
-                    path: "/v1/users/\(userId)/entitlements"
+                    path: "/v1/sdk/users/\(userId)/entitlements"
                 )
 
                 call.resolve([
@@ -502,7 +569,7 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                     // Fetch updated entitlements
                     let response = try await apiRequest(
                         method: "GET",
-                        path: "/v1/users/\(userId)/entitlements"
+                        path: "/v1/sdk/users/\(userId)/entitlements"
                     )
 
                     let entitlements = response["entitlements"] ?? []
@@ -518,7 +585,7 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                 do {
                     let response = try await apiRequest(
                         method: "GET",
-                        path: "/v1/users/\(userId)/entitlements"
+                        path: "/v1/sdk/users/\(userId)/entitlements"
                     )
 
                     call.resolve(["entitlements": response["entitlements"] ?? []])
@@ -582,16 +649,25 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                 receiptData = data.base64EncodedString()
             }
 
-            // Send to Capivv backend for verification
+            // V0.5.21 — POST /v1/sdk/receipts with the body shape
+            // SubmitReceiptRequest expects (see
+            // crates/capivv-api/src/routes/sdk/mod.rs). Pre-fix POSTed
+            // to /v1/purchases/apple/verify (server admin route, sk_-only)
+            // with the wrong body — every StoreKit transaction failed
+            // verification silently, blocking entitlement grants.
+            //
+            // idempotency_key uses the transaction id so retries / the
+            // Transaction.updates observer can re-submit safely.
             _ = try await apiRequest(
                 method: "POST",
-                path: "/v1/purchases/apple/verify",
+                path: "/v1/sdk/receipts",
                 body: [
                     "user_id": userId,
-                    "transaction_id": String(transaction.id),
-                    "original_transaction_id": String(transaction.originalID),
+                    "platform": "ios",
+                    "receipt_data": receiptData as Any,
                     "product_id": transaction.productID,
-                    "receipt_data": receiptData as Any
+                    "bundle_id": Bundle.main.bundleIdentifier as Any,
+                    "idempotency_key": String(transaction.id)
                 ]
             )
 
@@ -688,8 +764,18 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         if httpResponse.statusCode < 200 || httpResponse.statusCode >= 300 {
-            let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
-            throw NSError(domain: "CapivvPlugin", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorMessage])
+            // V0.5.21 — surface the server's response body in the error
+            // message AND log to NSLog at warn level so the React layer
+            // gets something useful instead of "Failed to get offerings:"
+            // with an empty colon (customer's reported symptom).
+            let body = String(data: data, encoding: .utf8) ?? "<empty>"
+            let message = "Capivv API error \(httpResponse.statusCode) on \(method) \(path): \(body)"
+            NSLog("[Capivv][warn] %@", message)
+            throw NSError(
+                domain: "CapivvPlugin",
+                code: httpResponse.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
         }
 
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {

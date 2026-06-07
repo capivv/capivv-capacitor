@@ -130,21 +130,27 @@ class CapivvPlugin : Plugin() {
         }
 
         userId = uid
-        val attributes = call.getObject("attributes") ?: JSObject()
 
         scope.launch {
             try {
+                // V0.5.21 — POST /v1/sdk/users with `{ external_id }`,
+                // matching the canonical SDK endpoint
+                // (crates/capivv-api/src/routes/sdk/mod.rs::create_or_get_user).
+                // Pre-fix POSTed to /v1/users/{id}/login (404 on the
+                // server). Same family of bug the customer's iOS audit
+                // caught for getOfferings.
                 val body = JSONObject().apply {
-                    put("attributes", attributes)
+                    put("external_id", uid)
                 }
 
-                val response = apiRequest("POST", "/v1/users/$uid/login", body)
+                val response = apiRequest("POST", "/v1/sdk/users", body)
+                val user = response.optJSONObject("user")
 
                 call.resolve(JSObject().apply {
                     put("userId", uid)
                     put("entitlements", response.optJSONArray("entitlements") ?: JSONArray())
-                    put("originalPurchaseDate", response.optString("original_purchase_date", null))
-                    put("latestPurchaseDate", response.optString("latest_purchase_date", null))
+                    put("originalPurchaseDate", user?.optString("first_seen_at"))
+                    put("latestPurchaseDate", user?.optString("last_seen_at"))
                 })
             } catch (e: Exception) {
                 call.reject("Failed to identify user: ${e.message}")
@@ -168,7 +174,7 @@ class CapivvPlugin : Plugin() {
 
         scope.launch {
             try {
-                val response = apiRequest("GET", "/v1/users/$uid/entitlements")
+                val response = apiRequest("GET", "/v1/sdk/users/$uid/entitlements")
 
                 call.resolve(JSObject().apply {
                     put("userId", uid)
@@ -199,27 +205,82 @@ class CapivvPlugin : Plugin() {
             return
         }
 
+        // V0.5.21 — /v1/sdk/offerings?user_id=<id>, the canonical SDK
+        // endpoint. Pre-fix called /v1/offerings (404 — confirmed by
+        // customer's curl on 2026-05-05). Same fix as iOS getOfferings.
+        val userIdParam = userId?.let {
+            "?user_id=" + java.net.URLEncoder.encode(it, "UTF-8")
+        } ?: ""
+
         scope.launch {
             try {
-                val response = apiRequest("GET", "/v1/offerings")
+                val response = apiRequest("GET", "/v1/sdk/offerings$userIdParam")
                 val offerings = response.optJSONArray("offerings") ?: JSONArray()
 
+                // V0.5.22 — parse the actual /v1/sdk/offerings response
+                // shape: `offering.packages[].product.external_id` (was
+                // `offering.products[].store_product_id`). Same fix as
+                // iOS Swift's getOfferings rewrite this same release.
+                //
+                // We always populate the API-derived product first so
+                // when Google Play Billing can't enumerate the product
+                // (test device without an account, app not yet
+                // submitted, etc.) the user still sees real prices
+                // from `pkg.price.formatted`.
                 val enrichedOfferings = JSONArray()
 
                 for (i in 0 until offerings.length()) {
                     val offering = offerings.getJSONObject(i)
-                    val products = offering.optJSONArray("products") ?: JSONArray()
+                    val packages = offering.optJSONArray("packages") ?: JSONArray()
 
-                    val productIds = mutableListOf<String>()
-                    for (j in 0 until products.length()) {
-                        val product = products.getJSONObject(j)
-                        product.optString("store_product_id")?.let { productIds.add(it) }
+                    val apiProducts = JSONArray()
+                    val storeIds = mutableListOf<String>()
+                    val storeIdToIndex = mutableMapOf<String, Int>()
+                    for (j in 0 until packages.length()) {
+                        val pkg = packages.getJSONObject(j)
+                        val product = pkg.optJSONObject("product") ?: JSONObject()
+                        val identifier = product.optString("external_id").ifEmpty {
+                            pkg.optString("identifier")
+                        }
+                        val price = pkg.optJSONObject("price")
+                        val entry = JSONObject().apply {
+                            put("identifier", identifier)
+                            put("title", product.optString("display_name"))
+                            put("description", product.optString("description"))
+                            put("priceString", price?.optString("formatted") ?: "")
+                            put("priceAmountMicros", (price?.optLong("amount_cents") ?: 0L) * 10000L)
+                            put("currencyCode", price?.optString("currency") ?: "USD")
+                            put("productType", pkg.optString("package_type", "subscription"))
+                        }
+                        if (identifier.isNotEmpty()) {
+                            storeIdToIndex[identifier] = j
+                            storeIds.add(identifier)
+                        }
+                        apiProducts.put(entry)
                     }
 
-                    val enrichedProducts = queryProducts(productIds)
+                    // Try Play Billing enrichment. queryProducts returns
+                    // an array of products it could find; merge by
+                    // identifier so unfound products keep their API
+                    // shape.
+                    if (storeIds.isNotEmpty()) {
+                        try {
+                            val storeProducts = queryProducts(storeIds)
+                            for (k in 0 until storeProducts.length()) {
+                                val sk = storeProducts.getJSONObject(k)
+                                val skId = sk.optString("identifier")
+                                val idx = storeIdToIndex[skId]
+                                if (idx != null) {
+                                    apiProducts.put(idx, sk)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            log("Play Billing enrichment failed (using API prices): ${e.message}")
+                        }
+                    }
 
                     val enrichedOffering = JSONObject(offering.toString())
-                    enrichedOffering.put("products", enrichedProducts)
+                    enrichedOffering.put("products", apiProducts)
                     enrichedOfferings.put(enrichedOffering)
                 }
 
@@ -274,8 +335,13 @@ class CapivvPlugin : Plugin() {
                 }
                 call.resolve(result)
             } catch (e: Exception) {
-                // 404 → graceful empty result; everything else → reject.
-                if (e.message?.contains("404") == true) {
+                // 404 → graceful "no template configured" fallback.
+                // 401/403/5xx/network → reject with the real reason so
+                // the caller can surface it. v0.5.19 fix — pre-fix used
+                // `e.message?.contains("404")` which was both fragile
+                // (matched any error containing "404") and silenced
+                // 401s as if they were graceful fallbacks.
+                if (e is CapivvApiException && e.status == 404) {
                     val fallback = JSObject().apply {
                         put("template", JSONObject.NULL)
                         put("version", "0.0.0")
@@ -283,6 +349,10 @@ class CapivvPlugin : Plugin() {
                     }
                     call.resolve(fallback)
                 } else {
+                    android.util.Log.w(
+                        "Capivv",
+                        "getPaywall failed for '$identifier': ${e.message}"
+                    )
                     call.reject("Failed to fetch paywall: ${e.message}")
                 }
             }
@@ -487,7 +557,7 @@ class CapivvPlugin : Plugin() {
                 }
 
                 // Fetch updated entitlements
-                val response = apiRequest("GET", "/v1/users/$uid/entitlements")
+                val response = apiRequest("GET", "/v1/sdk/users/$uid/entitlements")
                 val entitlements = response.optJSONArray("entitlements") ?: JSONArray()
 
                 notifyListeners("entitlementsUpdated", JSObject().apply {
@@ -521,7 +591,7 @@ class CapivvPlugin : Plugin() {
 
         scope.launch {
             try {
-                val response = apiRequest("GET", "/v1/users/$uid/entitlements")
+                val response = apiRequest("GET", "/v1/sdk/users/$uid/entitlements")
                 val entitlements = response.optJSONArray("entitlements") ?: JSONArray()
 
                 for (i in 0 until entitlements.length()) {
@@ -555,7 +625,7 @@ class CapivvPlugin : Plugin() {
 
         scope.launch {
             try {
-                val response = apiRequest("GET", "/v1/users/$uid/entitlements")
+                val response = apiRequest("GET", "/v1/sdk/users/$uid/entitlements")
 
                 call.resolve(JSObject().apply {
                     put("entitlements", response.optJSONArray("entitlements") ?: JSONArray())
@@ -579,7 +649,7 @@ class CapivvPlugin : Plugin() {
             // If billing client is not ready, just fetch from server
             scope.launch {
                 try {
-                    val response = apiRequest("GET", "/v1/users/$uid/entitlements")
+                    val response = apiRequest("GET", "/v1/sdk/users/$uid/entitlements")
 
                     call.resolve(JSObject().apply {
                         put("entitlements", response.optJSONArray("entitlements") ?: JSONArray())
@@ -608,7 +678,7 @@ class CapivvPlugin : Plugin() {
                 }
 
                 // Fetch updated entitlements
-                val response = apiRequest("GET", "/v1/users/$uid/entitlements")
+                val response = apiRequest("GET", "/v1/sdk/users/$uid/entitlements")
                 val entitlements = response.optJSONArray("entitlements") ?: JSONArray()
 
                 notifyListeners("entitlementsUpdated", JSObject().apply {
@@ -641,14 +711,23 @@ class CapivvPlugin : Plugin() {
 
     private suspend fun verifyPurchase(purchase: Purchase, userId: String) {
         try {
+            // V0.5.21 — POST /v1/sdk/receipts with the body shape
+            // SubmitReceiptRequest expects (see
+            // crates/capivv-api/src/routes/sdk/mod.rs). Pre-fix POSTed
+            // to /v1/purchases/google/verify (server admin route,
+            // sk_-only) so every Google Play transaction failed
+            // verification silently. Idempotency key is the order id.
+            val productId = purchase.products.firstOrNull()
             val body = JSONObject().apply {
                 put("user_id", userId)
-                put("purchase_token", purchase.purchaseToken)
-                put("product_ids", JSONArray(purchase.products))
-                put("order_id", purchase.orderId)
+                put("platform", "android")
+                put("receipt_data", purchase.purchaseToken)
+                if (productId != null) put("product_id", productId)
+                put("bundle_id", activity?.packageName ?: "")
+                put("idempotency_key", purchase.orderId ?: purchase.purchaseToken)
             }
 
-            apiRequest("POST", "/v1/purchases/google/verify", body)
+            apiRequest("POST", "/v1/sdk/receipts", body)
             log("Purchase verified: ${purchase.orderId}")
         } catch (e: Exception) {
             log("Failed to verify purchase: ${e.message}")
@@ -738,7 +817,20 @@ class CapivvPlugin : Plugin() {
                     val responseBody = response.body?.string() ?: "{}"
 
                     if (!response.isSuccessful) {
-                        cont.resumeWithException(Exception("API error (${response.code}): $responseBody"))
+                        // v0.5.19 — typed exception with `status` so callers
+                        // (notably getPaywall) can reliably discriminate
+                        // 404 (graceful fallback) from 401/5xx (real
+                        // failure that should propagate). Pre-fix used a
+                        // fragile `e.message?.contains("404")` check.
+                        // v0.5.21 — also Log.w so dev-mode tracing is
+                        // visible without flipping debug:true.
+                        android.util.Log.w(
+                            "Capivv",
+                            "API error ${response.code} on $method $path: $responseBody"
+                        )
+                        cont.resumeWithException(
+                            CapivvApiException(response.code, responseBody)
+                        )
                         return
                     }
 
@@ -763,3 +855,13 @@ class CapivvPlugin : Plugin() {
         scope.cancel()
     }
 }
+
+/**
+ * Typed exception carrying the HTTP status code so callers can
+ * discriminate 404 from 401/5xx. Mirrors the TypeScript
+ * `CapivvApiError` in the web layer (v0.5.19).
+ */
+class CapivvApiException(
+    val status: Int,
+    val responseBody: String,
+) : Exception("Capivv API error ($status): $responseBody")

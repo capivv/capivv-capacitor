@@ -59,6 +59,7 @@ export type ComponentType =
   | 'ctaButton'
   | 'restoreButton'
   | 'legal'
+  | 'legalLinks'
   | 'spacer'
   | 'container'
   // Phase E additions
@@ -94,6 +95,19 @@ export interface ComponentProps {
   fullWidth?: boolean;
   backgroundColor?: string;
   cornerRadius?: number;
+
+  // Legal-links properties (v0.5.28 — App Store guideline 3.1.2(c)
+  // requires functional Terms + Privacy links on the paywall itself,
+  // not just static disclaimer text. Missing them = guaranteed
+  // rejection at App Review).
+  termsUrl?: string;
+  privacyUrl?: string;
+  /**
+   * Auto-renewal disclosure text — also required by 3.1.2(c) for
+   * auto-renewable subscriptions. Defaults to a sensible English string
+   * when omitted; customers can override per locale.
+   */
+  autoRenewText?: string;
 
   // Spacer properties
   height?: number;
@@ -166,4 +180,22 @@ export interface TemplateLoadResult {
   version: string;
   updatedAt: string;
   cacheTtlSeconds?: number;
+  /**
+   * v0.5.37 — issue #16. Variants that were merged into the returned
+   * template server-side. Empty when the user wasn't identified or no
+   * running experiment is scoped to this paywall. Apps can also log
+   * these to their own analytics to track which arm rendered.
+   */
+  appliedVariants?: AppliedVariant[];
+}
+
+/**
+ * v0.5.37 — issue #16. A single variant merged into a paywall template.
+ */
+export interface AppliedVariant {
+  experimentId: string;
+  experimentName: string;
+  variantId: string;
+  variantName: string;
+  isControl: boolean;
 }

@@ -10,8 +10,9 @@
     "android/src/main/",
     "android/build.gradle",
     "dist/",
-    "ios/Plugin/",
-    "CapivvCapacitor.podspec"
+    "ios/Sources/",
+    "CapivvCapacitor.podspec",
+    "Package.swift"
   ],
   "author": "Capivv",
   "license": "MIT",
@@ -53,10 +54,10 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "@capacitor/android": "^6.0.0",
-    "@capacitor/core": "^6.0.0",
+    "@capacitor/android": ">=6.0.0",
+    "@capacitor/core": ">=6.0.0",
     "@capacitor/docgen": "^0.2.2",
-    "@capacitor/ios": "^6.0.0",
+    "@capacitor/ios": ">=6.0.0",
     "@ionic/eslint-config": "^0.4.0",
     "@ionic/prettier-config": "^4.0.0",
     "@ionic/swiftlint-config": "^1.1.2",

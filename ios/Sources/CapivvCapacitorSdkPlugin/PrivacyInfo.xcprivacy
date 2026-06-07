@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Privacy Manifest for @capivv/capacitor-sdk.
+
+  Apple requires every SDK to ship a PrivacyInfo.xcprivacy on iOS 17+;
+  cross-checked against the host app's App Store Privacy Nutrition Label
+  during review. Mismatch = rejection.
+
+  What Capivv collects:
+    - User ID (the appUserId the host app passes to Capivv.identify)
+      * Linked to the user (the same id ties together their entitlement
+        state, purchase history, and active subscription)
+      * NOT used for cross-app tracking
+      * Purpose: app functionality (entitlement lookups, restore-purchase
+        flow, server-side receipt validation)
+    - Purchase History (StoreKit receipts + product/transaction ids)
+      * Linked to the user
+      * NOT used for cross-app tracking
+      * Purpose: app functionality (receipt validation, entitlement
+        granting, idempotent re-submission)
+
+  What Capivv does NOT collect (audited by grep against the SDK source
+  in v0.5.23 — none of these APIs are touched):
+    - IDFV / device fingerprint
+    - Device model, OS version, app version (no explicit reads; URLSession
+      may include basic info in User-Agent, but the SDK does not enrich)
+    - Locale / language / time zone
+    - Network type (WiFi/cellular)
+    - Crash or performance diagnostics
+    - Active keyboards, disk space, file timestamps, system boot time,
+      UserDefaults — none of the iOS Required Reason API categories are
+      used, so NSPrivacyAccessedAPITypes is empty.
+
+  No tracking. Capivv does not link data across apps for advertising or
+  analytics outside the host app's own subscription operations, so
+  NSPrivacyTracking is false and NSPrivacyTrackingDomains is empty.
+-->
+<plist version="1.0">
+<dict>
+    <key>NSPrivacyTracking</key>
+    <false/>
+
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeUserID</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypePurchaseHistory</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+    </array>
+
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array/>
+</dict>
+</plist>
