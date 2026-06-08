@@ -396,6 +396,21 @@ export interface CapivvPlugin {
   getAssignedProductForExperiment(options: {
     experimentId: string;
     fallbackProductId: string;
+    /**
+     * v0.5.42 — issue #18 Primitive 2. When the variant's
+     * `config.product_override.country_codes` array is set, the override
+     * only applies if the user's country is in the list. Useful for
+     * country-scoped pricing A/Bs (e.g. lower-priced BR-only tier).
+     * Omit to ignore country filtering (matches v0.5.41 behavior —
+     * override applies everywhere).
+     *
+     * Pass the StoreKit storefront country code (e.g. "BR", "PT"); the
+     * SDK doesn't auto-detect because Capacitor doesn't expose a
+     * cross-platform storefront API. iOS apps can read it via
+     * `SKStorefront.current.countryCode`; web/Android typically have
+     * the value from prior identify metadata or geo lookup.
+     */
+    countryCode?: string;
   }): Promise<AssignedProduct>;
 
   /**

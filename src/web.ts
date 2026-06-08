@@ -116,16 +116,36 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
   async getAssignedProductForExperiment(options: {
     experimentId: string;
     fallbackProductId: string;
+    countryCode?: string;
   }): Promise<AssignedProduct> {
     const va = await this.getVariantForExperiment({ experimentId: options.experimentId });
     // The override convention: variant.config.product_override.external_id
     // is the SKU the app should pass to Capivv.purchase. If absent (control
     // arm, no override, or no running experiment), use the fallback.
     const override = va.config?.product_override as
-      | { external_id?: string; product_id?: string }
+      | { external_id?: string; product_id?: string; country_codes?: unknown }
       | undefined;
+    // v0.5.42 — issue #18 Primitive 2. If the override specifies
+    // country_codes, only apply when the caller's countryCode matches
+    // one of them. countryCode unset → ignore the filter (preserves
+    // v0.5.41 behavior). country_codes unset → override applies
+    // unconditionally (also v0.5.41 behavior). Case-insensitive match
+    // because Apple gives ISO 3166-1 alpha-2 uppercase, but operators
+    // may type either case in the config.
+    const countryFilter = Array.isArray(override?.country_codes)
+      ? (override?.country_codes as unknown[])
+          .filter((c): c is string => typeof c === 'string')
+          .map((c) => c.toUpperCase())
+      : null;
+    const countryMatches =
+      countryFilter === null ||
+      countryFilter.length === 0 ||
+      (typeof options.countryCode === 'string' &&
+        countryFilter.includes(options.countryCode.toUpperCase()));
     const overrideId =
-      typeof override?.external_id === 'string' && override.external_id.length > 0
+      countryMatches &&
+      typeof override?.external_id === 'string' &&
+      override.external_id.length > 0
         ? override.external_id
         : null;
     return {

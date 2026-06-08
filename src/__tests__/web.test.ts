@@ -565,6 +565,132 @@ describe('Capivv Web Implementation', () => {
       vi.unstubAllGlobals();
     });
 
+    it('honors country_codes filter: applies override when caller country matches', async () => {
+      const { CapivvWeb } = await import('../web');
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ entitlements: [], experiment_assignments: [] }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            experiment_id: 'pt-br-tier-test-v1',
+            variant_id: 'lower-tier',
+            variant_name: 'lower',
+            is_control: false,
+            config: {
+              product_override: {
+                external_id: 'com.test.pro.monthly.br_lower',
+                country_codes: ['BR', 'pt'], // mixed case to exercise normalization
+              },
+            },
+          }),
+        });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const sdk = new CapivvWeb();
+      await sdk.configure({ apiKey: 'pk_test_abc' });
+      await sdk.identify({ userId: 'u1' });
+
+      const result = await sdk.getAssignedProductForExperiment({
+        experimentId: 'pt-br-tier-test-v1',
+        fallbackProductId: 'com.test.pro.monthly',
+        countryCode: 'br', // lowercase from caller
+      });
+
+      expect(result.productId).toBe('com.test.pro.monthly.br_lower');
+      expect(result.source).toBe('variant_override');
+
+      vi.unstubAllGlobals();
+    });
+
+    it('honors country_codes filter: falls back when caller country does not match', async () => {
+      const { CapivvWeb } = await import('../web');
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ entitlements: [], experiment_assignments: [] }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            experiment_id: 'pt-br-tier-test-v1',
+            variant_id: 'lower-tier',
+            variant_name: 'lower',
+            is_control: false,
+            config: {
+              product_override: {
+                external_id: 'com.test.pro.monthly.br_lower',
+                country_codes: ['BR'],
+              },
+            },
+          }),
+        });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const sdk = new CapivvWeb();
+      await sdk.configure({ apiKey: 'pk_test_abc' });
+      await sdk.identify({ userId: 'u1' });
+
+      const result = await sdk.getAssignedProductForExperiment({
+        experimentId: 'pt-br-tier-test-v1',
+        fallbackProductId: 'com.test.pro.monthly',
+        countryCode: 'US',
+      });
+
+      expect(result.productId).toBe('com.test.pro.monthly');
+      expect(result.source).toBe('fallback');
+      // Variant data is still surfaced so app can log "user was in lower-tier
+      // arm but country didn't match, used fallback price."
+      expect(result.variantName).toBe('lower');
+
+      vi.unstubAllGlobals();
+    });
+
+    it('applies override unconditionally when country_codes is absent (v0.5.41 behavior preserved)', async () => {
+      const { CapivvWeb } = await import('../web');
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ entitlements: [], experiment_assignments: [] }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            experiment_id: 'global-tier-test',
+            variant_id: 'tier-2',
+            variant_name: 't2',
+            is_control: false,
+            config: {
+              product_override: {
+                external_id: 'com.test.pro.monthly.t2',
+                // no country_codes → applies everywhere
+              },
+            },
+          }),
+        });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const sdk = new CapivvWeb();
+      await sdk.configure({ apiKey: 'pk_test_abc' });
+      await sdk.identify({ userId: 'u1' });
+
+      const result = await sdk.getAssignedProductForExperiment({
+        experimentId: 'global-tier-test',
+        fallbackProductId: 'com.test.pro.monthly',
+        countryCode: 'JP',
+      });
+
+      expect(result.productId).toBe('com.test.pro.monthly.t2');
+      expect(result.source).toBe('variant_override');
+
+      vi.unstubAllGlobals();
+    });
+
     it('falls back when experiment is not running (variantId null)', async () => {
       const { CapivvWeb } = await import('../web');
       const fetchMock = vi
