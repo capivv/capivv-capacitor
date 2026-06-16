@@ -179,6 +179,26 @@ export interface VariantAssignment {
 }
 
 /**
+ * v0.5.44 — result of `Capivv.getPromotionalOfferForExperiment`. Issue #18
+ * Primitive 3. Apple-signed promotional offer payload. App passes
+ * these four fields to `SKMutablePayment.paymentDiscount` (iOS) or
+ * the Android equivalent at purchase time.
+ *
+ * `signatureBase64` is the ECDSA-P256 signature over the canonical
+ * payload (appBundleID + keyIdentifier + productIdentifier +
+ * offerIdentifier + lowercased applicationUsername + nonce + timestamp,
+ * separated by U+2063). Apple's StoreKit verifies it against the
+ * customer's public key on file. Signatures expire after ~24h per
+ * Apple's spec.
+ */
+export interface PromotionalOfferPayload {
+  keyIdentifier: string;
+  nonce: string;
+  timestampMs: string;
+  signatureBase64: string;
+}
+
+/**
  * v0.5.40 — result of `Capivv.getAssignedProductForExperiment`. Issue #18
  * Primitive 1. Convenience helper that resolves `variant.config.product_override`
  * to a concrete product identifier the app can pass to `Capivv.purchase`.
@@ -329,7 +349,22 @@ export interface CapivvPlugin {
    * @param options - User identification options
    * @returns Promise with user information
    */
-  identify(options: { userId: string; attributes?: UserAttributes }): Promise<UserInfo>;
+  /**
+   * Identify the current user.
+   *
+   * v0.5.51 — `preExperimentCovariates` accepts a map of named numeric
+   * covariates (e.g. `{ lifetime_revenue_28d: 12.5 }`) for CUPED
+   * variance reduction on Bayesian posteriors (#18 analysis surface
+   * slice 4). The backend UPSERTs by (user, covariate_name) so
+   * re-identifying with the same key overwrites with the latest
+   * value. Omit when you don't have one — posteriors fall back to
+   * the v0.5.45 binary-conversion math.
+   */
+  identify(options: {
+    userId: string;
+    attributes?: UserAttributes;
+    preExperimentCovariates?: Record<string, number>;
+  }): Promise<UserInfo>;
 
   /**
    * Log out the current user.
@@ -393,6 +428,32 @@ export interface CapivvPlugin {
    * await Capivv.purchase({ productIdentifier: productId });
    * ```
    */
+  /**
+   * v0.5.44 — issue #18 Primitive 3. Fetches a signed Apple promotional
+   * offer payload tied to the user's variant assignment. The variant
+   * config must carry `promotional_offer_config.offer_identifier`
+   * (configured in App Store Connect under the subscription's
+   * promotional offers). The customer's promotional-offer signing key
+   * (separate from the ASC API key) must be uploaded via the dashboard.
+   *
+   * Returns 404 if the variant has no offer configured (control arm or
+   * experiment not running). Returns 400 if the signing key isn't
+   * uploaded yet — error body says exactly what's missing.
+   *
+   * @example
+   * ```ts
+   * const offer = await Capivv.getPromotionalOfferForExperiment({
+   *   experimentId: 'price-monthly-tier-test-v1',
+   * });
+   * // iOS / Capacitor StoreKit2: pass offer.* into SKMutablePayment.paymentDiscount.
+   * ```
+   */
+  getPromotionalOfferForExperiment(options: {
+    experimentId: string;
+    /** Override the product identifier (rarely needed — the variant config or product_override usually carries it). */
+    productIdentifier?: string;
+  }): Promise<PromotionalOfferPayload>;
+
   getAssignedProductForExperiment(options: {
     experimentId: string;
     fallbackProductId: string;

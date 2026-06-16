@@ -15,6 +15,7 @@ import type {
   VariantAssignment,
   ExperimentAssignment,
   AssignedProduct,
+  PromotionalOfferPayload,
 } from './definitions';
 import { CapivvApiError } from './definitions';
 import { PurchaseState } from './definitions';
@@ -41,13 +42,19 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     }
   }
 
-  async identify(options: { userId: string; attributes?: UserAttributes }): Promise<UserInfo> {
+  async identify(options: {
+    userId: string;
+    attributes?: UserAttributes;
+    preExperimentCovariates?: Record<string, number>;
+  }): Promise<UserInfo> {
     this.ensureConfigured();
     this.userId = options.userId;
 
     const response = await this.apiRequest('POST', `/v1/sdk/users`, {
       external_id: options.userId,
       attributes: options.attributes,
+      // v0.5.51 — CUPED ingest. Backend UPSERTs by (user, covariate_name).
+      pre_experiment_covariates: options.preExperimentCovariates,
     });
 
     const data = response as any;
@@ -106,6 +113,35 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
       isControl: data.is_control ?? null,
       // v0.5.40 — issue #18 Primitive 1. Server returns the object as-is.
       config: (data.config as Record<string, unknown> | null | undefined) ?? null,
+    };
+  }
+
+  /**
+   * v0.5.44 — issue #18 Primitive 3. See definitions.ts for full doc.
+   */
+  async getPromotionalOfferForExperiment(options: {
+    experimentId: string;
+    productIdentifier?: string;
+  }): Promise<PromotionalOfferPayload> {
+    this.ensureConfigured();
+    this.ensureIdentified();
+
+    const params = options.productIdentifier
+      ? `?product_identifier=${encodeURIComponent(options.productIdentifier)}`
+      : '';
+    const response = await this.apiRequest(
+      'GET',
+      `/v1/sdk/users/${encodeURIComponent(this.userId!)}/experiments/${encodeURIComponent(
+        options.experimentId,
+      )}/promotional-offer${params}`,
+    );
+
+    const data = response as Record<string, unknown>;
+    return {
+      keyIdentifier: data.key_identifier as string,
+      nonce: data.nonce as string,
+      timestampMs: data.timestamp_ms as string,
+      signatureBase64: data.signature_base64 as string,
     };
   }
 

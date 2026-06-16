@@ -139,8 +139,19 @@ class CapivvPlugin : Plugin() {
                 // Pre-fix POSTed to /v1/users/{id}/login (404 on the
                 // server). Same family of bug the customer's iOS audit
                 // caught for getOfferings.
+                //
+                // v0.5.57 — pass-through preExperimentCovariates for CUPED
+                // ingest. The web shim has carried this since v0.5.51,
+                // but the native plugin dropped it on the floor — same
+                // bug class as #20. Without this, CUPED-declared
+                // experiments on native silently fall back to binary
+                // posterior because no covariate ever reaches
+                // experiment_covariates.
                 val body = JSONObject().apply {
                     put("external_id", uid)
+                    call.getObject("preExperimentCovariates")?.let { covariates ->
+                        put("pre_experiment_covariates", covariates)
+                    }
                 }
 
                 val response = apiRequest("POST", "/v1/sdk/users", body)
@@ -163,6 +174,150 @@ class CapivvPlugin : Plugin() {
         userId = null
         call.resolve()
     }
+
+    // MARK: Experiment surface (v0.5.56 — issue #20)
+    //
+    // Mirrors web.ts's getVariantForExperiment / getAssignedProductForExperiment
+    // / getPromotionalOfferForExperiment. The web shim has carried these
+    // since v0.5.35 / v0.5.40 / v0.5.44, but Capacitor routes JS calls to
+    // the NATIVE plugin on Android — methods missing here reject with
+    // UNIMPLEMENTED and apps silently swallow it via `.catch`. Net effect:
+    // every Android user since v0.5.35 who called getVariantForExperiment
+    // got null back; the server never saw the request.
+
+    @PluginMethod
+    fun getVariantForExperiment(call: PluginCall) {
+        if (apiKey == null) {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        val uid = userId
+        if (uid == null) {
+            call.reject("User not identified. Call identify() first.")
+            return
+        }
+        val experimentId = call.getString("experimentId")
+        if (experimentId == null) {
+            call.reject("experimentId is required")
+            return
+        }
+
+        val path = "/v1/sdk/users/${urlEscape(uid)}/experiments/${urlEscape(experimentId)}/variant"
+
+        scope.launch {
+            try {
+                val response = apiRequest("GET", path)
+                call.resolve(JSObject().apply {
+                    put("experimentId", response.optString("experiment_id", experimentId))
+                    put("variantId", response.opt("variant_id") ?: JSONObject.NULL)
+                    put("variantName", response.opt("variant_name") ?: JSONObject.NULL)
+                    put("isControl", response.opt("is_control") ?: JSONObject.NULL)
+                    put("config", response.opt("config") ?: JSONObject.NULL)
+                })
+            } catch (e: Exception) {
+                call.reject("Failed to get variant for experiment: ${e.message}")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun getAssignedProductForExperiment(call: PluginCall) {
+        if (apiKey == null) {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        val uid = userId
+        if (uid == null) {
+            call.reject("User not identified. Call identify() first.")
+            return
+        }
+        val experimentId = call.getString("experimentId")
+        val fallbackProductId = call.getString("fallbackProductId")
+        if (experimentId == null || fallbackProductId == null) {
+            call.reject("experimentId and fallbackProductId are required")
+            return
+        }
+        val countryCode = call.getString("countryCode")
+
+        val path = "/v1/sdk/users/${urlEscape(uid)}/experiments/${urlEscape(experimentId)}/variant"
+
+        scope.launch {
+            try {
+                val response = apiRequest("GET", path)
+                val config = response.optJSONObject("config")
+                val productOverride = config?.optJSONObject("product_override")
+                val externalId = productOverride?.optString("external_id", "")?.takeIf { it.isNotEmpty() }
+                val countryCodesArr = productOverride?.optJSONArray("country_codes")
+
+                // Country filter: case-insensitive ISO 3166-1 alpha-2.
+                // Mirror web.ts: empty/null country_codes = unconditional;
+                // missing countryCode arg = ignore the filter.
+                val countryFilter: List<String>? = countryCodesArr?.let { arr ->
+                    (0 until arr.length()).mapNotNull { i ->
+                        (arr.opt(i) as? String)?.uppercase()
+                    }
+                }
+                val countryMatches = when {
+                    countryFilter.isNullOrEmpty() -> true
+                    countryCode == null -> false
+                    else -> countryFilter.contains(countryCode.uppercase())
+                }
+
+                val overrideId: String? = if (countryMatches) externalId else null
+
+                call.resolve(JSObject().apply {
+                    put("productId", overrideId ?: fallbackProductId)
+                    put("source", if (overrideId != null) "variant_override" else "fallback")
+                    put("variantId", response.opt("variant_id") ?: JSONObject.NULL)
+                    put("variantName", response.opt("variant_name") ?: JSONObject.NULL)
+                    put("isControl", response.opt("is_control") ?: JSONObject.NULL)
+                })
+            } catch (e: Exception) {
+                call.reject("Failed to get assigned product for experiment: ${e.message}")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun getPromotionalOfferForExperiment(call: PluginCall) {
+        if (apiKey == null) {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        val uid = userId
+        if (uid == null) {
+            call.reject("User not identified. Call identify() first.")
+            return
+        }
+        val experimentId = call.getString("experimentId")
+        if (experimentId == null) {
+            call.reject("experimentId is required")
+            return
+        }
+        val productIdentifier = call.getString("productIdentifier")
+
+        var path = "/v1/sdk/users/${urlEscape(uid)}/experiments/${urlEscape(experimentId)}/promotional-offer"
+        if (productIdentifier != null) {
+            path += "?product_identifier=${urlEscape(productIdentifier)}"
+        }
+
+        scope.launch {
+            try {
+                val response = apiRequest("GET", path)
+                call.resolve(JSObject().apply {
+                    put("keyIdentifier", response.optString("key_identifier", ""))
+                    put("nonce", response.optString("nonce", ""))
+                    put("timestampMs", response.optString("timestamp_ms", ""))
+                    put("signatureBase64", response.optString("signature_base64", ""))
+                })
+            } catch (e: Exception) {
+                call.reject("Failed to get promotional offer for experiment: ${e.message}")
+            }
+        }
+    }
+
+    private fun urlEscape(s: String): String =
+        java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 
     @PluginMethod
     fun getUserInfo(call: PluginCall) {
@@ -312,13 +467,19 @@ class CapivvPlugin : Plugin() {
         }
 
         val encodedIdentifier = java.net.URLEncoder.encode(identifier, "UTF-8")
+        // v0.5.57 — pass user_id when identified so the server merges
+        // active experiment variant.config into the returned template
+        // (issue #16 / v0.5.37). The native plugin never did this — every
+        // native customer using paywall-template A/B variants was getting
+        // the raw template instead of their assigned variant's merged one.
+        var path = "/v1/paywalls/by-identifier/$encodedIdentifier/template"
+        userId?.let { uid ->
+            path += "?user_id=${urlEscape(uid)}"
+        }
 
         scope.launch {
             try {
-                val response = apiRequest(
-                    "GET",
-                    "/v1/paywalls/by-identifier/$encodedIdentifier/template"
-                )
+                val response = apiRequest("GET", path)
                 val result = JSObject()
                 if (response.isNull("template")) {
                     result.put("template", JSONObject.NULL)
@@ -333,6 +494,23 @@ class CapivvPlugin : Plugin() {
                 if (response.has("cache_ttl_seconds") && !response.isNull("cache_ttl_seconds")) {
                     result.put("cacheTtlSeconds", response.getInt("cache_ttl_seconds"))
                 }
+                // v0.5.57 — surface appliedVariants so native apps can
+                // log them to their own analytics (mirrors web.ts).
+                val appliedArr = response.optJSONArray("applied_variants")
+                val appliedOut = JSONArray()
+                if (appliedArr != null) {
+                    for (i in 0 until appliedArr.length()) {
+                        val v = appliedArr.optJSONObject(i) ?: continue
+                        appliedOut.put(JSONObject().apply {
+                            put("experimentId", v.opt("experiment_id") ?: JSONObject.NULL)
+                            put("experimentName", v.opt("experiment_name") ?: JSONObject.NULL)
+                            put("variantId", v.opt("variant_id") ?: JSONObject.NULL)
+                            put("variantName", v.opt("variant_name") ?: JSONObject.NULL)
+                            put("isControl", v.optBoolean("is_control", false))
+                        })
+                    }
+                }
+                result.put("appliedVariants", appliedOut)
                 call.resolve(result)
             } catch (e: Exception) {
                 // 404 → graceful "no template configured" fallback.
@@ -346,6 +524,7 @@ class CapivvPlugin : Plugin() {
                         put("template", JSONObject.NULL)
                         put("version", "0.0.0")
                         put("updatedAt", java.time.Instant.now().toString())
+                        put("appliedVariants", JSONArray())
                     }
                     call.resolve(fallback)
                 } else {

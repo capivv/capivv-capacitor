@@ -23,7 +23,18 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "checkEntitlement", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getEntitlements", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "syncPurchases", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "manageSubscriptions", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "manageSubscriptions", returnType: CAPPluginReturnPromise),
+        // v0.5.56 — native parity for the experiment surface. The JS web
+        // shim has carried these since v0.5.35 / v0.5.40 / v0.5.44, but
+        // Capacitor routes JS calls to the NATIVE plugin on iOS — methods
+        // missing here reject with UNIMPLEMENTED, which apps silently
+        // swallow via `.catch`. Net effect: every iOS user since v0.5.35
+        // who called getVariantForExperiment got null back; the server
+        // never saw the request; experiment_assignments stayed empty even
+        // for actively-running experiments. Issue #20.
+        CAPPluginMethod(name: "getVariantForExperiment", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getAssignedProductForExperiment", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getPromotionalOfferForExperiment", returnType: CAPPluginReturnPromise)
     ]
 
     private var apiKey: String?
@@ -79,12 +90,24 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
         // every Capivv.identify() call returned a 404 the JS bridge
         // swallowed silently. Server handler:
         // crates/capivv-api/src/routes/sdk/mod.rs::create_or_get_user.
+        //
+        // v0.5.57 — pass-through preExperimentCovariates for CUPED ingest
+        // (v0.5.51 web shim, never bridged to native). Server expects
+        // snake_case `pre_experiment_covariates: { name: number }`.
+        // Without this, CUPED-declared experiments on native silently
+        // fall back to binary posterior because no covariate ever
+        // reaches experiment_covariates.
+        var body: [String: Any] = ["external_id": userId]
+        if let covariates = call.getObject("preExperimentCovariates") {
+            body["pre_experiment_covariates"] = covariates
+        }
+
         Task {
             do {
                 let response = try await apiRequest(
                     method: "POST",
                     path: "/v1/sdk/users",
-                    body: ["external_id": userId]
+                    body: body
                 )
 
                 let user = response["user"] as? [String: Any]
@@ -98,6 +121,136 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                 call.reject("Failed to identify user: \(error.localizedDescription)")
             }
         }
+    }
+
+    // MARK: - Experiment surface (v0.5.56 — issue #20)
+    //
+    // Mirrors web.ts's getVariantForExperiment / getAssignedProductForExperiment
+    // / getPromotionalOfferForExperiment exactly. Server route per file:
+    //   crates/capivv-api/src/routes/sdk/mod.rs — get_user_experiment_variant.
+
+    @objc func getVariantForExperiment(_ call: CAPPluginCall) {
+        guard apiKey != nil else {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        guard let userId = self.userId else {
+            call.reject("User not identified. Call identify() first.")
+            return
+        }
+        guard let experimentId = call.getString("experimentId") else {
+            call.reject("experimentId is required")
+            return
+        }
+
+        let path = "/v1/sdk/users/\(urlEscape(userId))/experiments/\(urlEscape(experimentId))/variant"
+
+        Task {
+            do {
+                let response = try await apiRequest(method: "GET", path: path)
+                call.resolve([
+                    "experimentId": response["experiment_id"] ?? experimentId,
+                    "variantId": response["variant_id"] ?? NSNull(),
+                    "variantName": response["variant_name"] ?? NSNull(),
+                    "isControl": response["is_control"] ?? NSNull(),
+                    "config": response["config"] ?? NSNull()
+                ])
+            } catch {
+                call.reject("Failed to get variant for experiment: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    @objc func getAssignedProductForExperiment(_ call: CAPPluginCall) {
+        guard apiKey != nil else {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        guard let userId = self.userId else {
+            call.reject("User not identified. Call identify() first.")
+            return
+        }
+        guard let experimentId = call.getString("experimentId"),
+              let fallbackProductId = call.getString("fallbackProductId") else {
+            call.reject("experimentId and fallbackProductId are required")
+            return
+        }
+        let countryCode = call.getString("countryCode")
+
+        let path = "/v1/sdk/users/\(urlEscape(userId))/experiments/\(urlEscape(experimentId))/variant"
+
+        Task {
+            do {
+                let response = try await apiRequest(method: "GET", path: path)
+                let config = response["config"] as? [String: Any]
+                let productOverride = config?["product_override"] as? [String: Any]
+                let externalId = productOverride?["external_id"] as? String
+                let countryCodesRaw = productOverride?["country_codes"] as? [Any]
+
+                // Country filter: case-insensitive ISO 3166-1 alpha-2.
+                // Mirror web.ts semantics — empty/nil country_codes means
+                // unconditional override; missing countryCode arg means
+                // ignore the filter.
+                let countryFilter: [String]? = countryCodesRaw?.compactMap { ($0 as? String)?.uppercased() }
+                let countryMatches: Bool
+                if let filter = countryFilter, !filter.isEmpty {
+                    countryMatches = countryCode.map { filter.contains($0.uppercased()) } ?? false
+                } else {
+                    countryMatches = true
+                }
+
+                let overrideId: String? = (countryMatches && externalId?.isEmpty == false) ? externalId : nil
+
+                call.resolve([
+                    "productId": overrideId ?? fallbackProductId,
+                    "source": overrideId != nil ? "variant_override" : "fallback",
+                    "variantId": response["variant_id"] ?? NSNull(),
+                    "variantName": response["variant_name"] ?? NSNull(),
+                    "isControl": response["is_control"] ?? NSNull()
+                ])
+            } catch {
+                call.reject("Failed to get assigned product for experiment: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    @objc func getPromotionalOfferForExperiment(_ call: CAPPluginCall) {
+        guard apiKey != nil else {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        guard let userId = self.userId else {
+            call.reject("User not identified. Call identify() first.")
+            return
+        }
+        guard let experimentId = call.getString("experimentId") else {
+            call.reject("experimentId is required")
+            return
+        }
+        let productIdentifier = call.getString("productIdentifier")
+
+        var path = "/v1/sdk/users/\(urlEscape(userId))/experiments/\(urlEscape(experimentId))/promotional-offer"
+        if let pid = productIdentifier {
+            path += "?product_identifier=\(urlEscape(pid))"
+        }
+
+        Task {
+            do {
+                let response = try await apiRequest(method: "GET", path: path)
+                call.resolve([
+                    "keyIdentifier": response["key_identifier"] ?? "",
+                    "nonce": response["nonce"] ?? "",
+                    "timestampMs": response["timestamp_ms"] ?? "",
+                    "signatureBase64": response["signature_base64"] ?? ""
+                ])
+            } catch {
+                call.reject("Failed to get promotional offer for experiment: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func urlEscape(_ s: String) -> String {
+        s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? s
     }
 
     @objc func logout(_ call: CAPPluginCall) {
@@ -269,12 +422,21 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
             withAllowedCharacters: .urlPathAllowed
         ) ?? identifier
 
+        // v0.5.57 — pass user_id when identified so the server merges
+        // active experiment variant.config into the returned template
+        // (issue #16 / v0.5.37). The native plugin never did this — every
+        // native customer using paywall-template A/B variants was getting
+        // the raw template instead of their assigned variant's merged one.
+        // Falls back to v0.5.37's "no user_id" behavior when not identified.
+        var path = "/v1/paywalls/by-identifier/\(encodedIdentifier)/template"
+        if let uid = self.userId,
+           let encoded = uid.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            path += "?user_id=\(encoded)"
+        }
+
         Task {
             do {
-                let response = try await apiRequest(
-                    method: "GET",
-                    path: "/v1/paywalls/by-identifier/\(encodedIdentifier)/template"
-                )
+                let response = try await apiRequest(method: "GET", path: path)
 
                 let template = response["template"] ?? NSNull()
                 let version = response["version"] as? String ?? "1.0.0"
@@ -288,13 +450,29 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                 if let ttl = response["cache_ttl_seconds"] as? Int {
                     result["cacheTtlSeconds"] = ttl
                 }
+                // v0.5.57 — surface appliedVariants so native apps can
+                // log them to their own analytics (mirrors web.ts).
+                if let applied = response["applied_variants"] as? [[String: Any]] {
+                    result["appliedVariants"] = applied.map { v -> [String: Any] in
+                        return [
+                            "experimentId": v["experiment_id"] ?? NSNull(),
+                            "experimentName": v["experiment_name"] ?? NSNull(),
+                            "variantId": v["variant_id"] ?? NSNull(),
+                            "variantName": v["variant_name"] ?? NSNull(),
+                            "isControl": v["is_control"] ?? false
+                        ]
+                    }
+                } else {
+                    result["appliedVariants"] = []
+                }
                 call.resolve(result)
             } catch let error as NSError where error.code == 404 {
                 // Graceful fallback — no template configured for this id.
                 call.resolve([
                     "template": NSNull(),
                     "version": "0.0.0",
-                    "updatedAt": ISO8601DateFormatter().string(from: Date())
+                    "updatedAt": ISO8601DateFormatter().string(from: Date()),
+                    "appliedVariants": []
                 ])
             } catch {
                 call.reject("Failed to fetch paywall: \(error.localizedDescription)")
