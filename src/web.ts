@@ -58,6 +58,13 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     });
 
     const data = response as any;
+    // v0.5.63 — issue #31. The server mints a per-user device-bound
+    // deletion token on the FIRST identify (absent thereafter). Persist
+    // it locally so deleteCurrentUser() can present it later. Kept
+    // SDK-internal — the app never handles the token.
+    if (typeof data.deletion_token === 'string' && data.deletion_token) {
+      this.storeDeletionToken(data.deletion_token);
+    }
     return {
       userId: options.userId,
       entitlements: data.entitlements || [],
@@ -71,6 +78,58 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
 
   async logout(): Promise<void> {
     this.userId = null;
+  }
+
+  /**
+   * v0.5.63 — issue #31 / RFC #30. Erase the current user's Capivv data,
+   * authorized by the device-bound deletion token minted on identify
+   * (not the publishable key). See CapivvPlugin.deleteCurrentUser docs.
+   */
+  async deleteCurrentUser(options?: { hardDelete?: boolean }): Promise<{ status: string }> {
+    this.ensureConfigured();
+    const token = this.readDeletionToken();
+    if (!token) {
+      throw new Error(
+        'Capivv.deleteCurrentUser: no deletion token available. It is minted on the first ' +
+          'identify() — call identify() to obtain one, or perform deletion server-side with a ' +
+          'secret (sk_) key. (Users created before deletion support, or after local storage was ' +
+          'cleared, will not have a token until the next identify().)',
+      );
+    }
+    const response = await this.apiRequest('POST', '/v1/sdk/users/delete-current', {
+      deletion_token: token,
+      hard_delete: options?.hardDelete ?? false,
+    });
+    // Erased — clear local identity + the now-consumed token.
+    this.clearDeletionToken();
+    this.userId = null;
+    return { status: (response as { status?: string }).status ?? 'anonymized' };
+  }
+
+  // v0.5.63 — issue #31. Deletion-token persistence. localStorage is the
+  // web equivalent of the native secure store; guarded so the SDK still
+  // works in non-browser contexts (SSR/tests) where it's undefined.
+  private readonly deletionTokenKey = 'capivv_deletion_token';
+  private storeDeletionToken(token: string): void {
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.setItem(this.deletionTokenKey, token);
+    } catch {
+      /* storage unavailable — deleteCurrentUser will surface a clear error */
+    }
+  }
+  private readDeletionToken(): string | null {
+    try {
+      return typeof localStorage !== 'undefined' ? localStorage.getItem(this.deletionTokenKey) : null;
+    } catch {
+      return null;
+    }
+  }
+  private clearDeletionToken(): void {
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(this.deletionTokenKey);
+    } catch {
+      /* ignore */
+    }
   }
 
   async getUserInfo(): Promise<UserInfo> {
@@ -437,6 +496,9 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
   async getPaywall(options: { identifier: string }): Promise<PaywallResult> {
     const result = await this.getPaywallTemplate(options.identifier);
     return {
+      // v0.5.60 — issue #23. Surface the paywall id so callers can pass it
+      // to reportPaywallImpression without hardcoding.
+      id: result.id,
       template: result.template,
       version: result.version,
       updatedAt: result.updatedAt,
@@ -444,6 +506,28 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
       // v0.5.37 — issue #16. Surface merged variants for app-side analytics.
       appliedVariants: result.appliedVariants ?? [],
     };
+  }
+
+  /**
+   * v0.5.59 — issue #22. Report that the user was shown a paywall.
+   * See CapivvPlugin.reportPaywallImpression for full docs.
+   */
+  async reportPaywallImpression(options: {
+    paywallId: string;
+    experimentId?: string;
+    variantId?: string;
+  }): Promise<{ status: string }> {
+    this.ensureConfigured();
+    const body: Record<string, unknown> = {};
+    if (this.userId) body.user_id = this.userId;
+    if (options.experimentId) body.experiment_id = options.experimentId;
+    if (options.variantId) body.variant_id = options.variantId;
+    const response = await this.apiRequest(
+      'POST',
+      `/v1/sdk/paywalls/${encodeURIComponent(options.paywallId)}/impressions`,
+      body,
+    );
+    return { status: (response as { status?: string }).status ?? 'recorded' };
   }
 
   /**
@@ -486,6 +570,8 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
 
       const data = response as Record<string, unknown>;
       return {
+        // v0.5.60 — issue #23. Paywall id from the response.
+        id: (data.id as string) || '',
         template: data.template as TemplateDefinition | null,
         version: (data.version as string) || '1.0.0',
         updatedAt: (data.updated_at as string) || new Date().toISOString(),
@@ -508,6 +594,8 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
           console.log(`[Capivv] No template configured for paywall '${identifier}' (404)`);
         }
         return {
+          // v0.5.60 — issue #23. No paywall → no id.
+          id: '',
           template: null,
           version: '0.0.0',
           updatedAt: new Date().toISOString(),
@@ -526,7 +614,7 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
    */
   async getPaywallWithTemplate(
     identifier: string
-  ): Promise<{ offerings: Offering[]; template: TemplateDefinition | null }> {
+  ): Promise<{ paywallId: string; offerings: Offering[]; template: TemplateDefinition | null }> {
     this.ensureConfigured();
 
     const [offeringsResult, templateResult] = await Promise.all([
@@ -535,6 +623,9 @@ export class CapivvWeb extends WebPlugin implements CapivvPlugin {
     ]);
 
     return {
+      // v0.5.60 — issue #23. Surface the id here too so callers using the
+      // combined fetch can report impressions without a second round-trip.
+      paywallId: templateResult.id,
       offerings: offeringsResult.offerings,
       template: templateResult.template,
     };

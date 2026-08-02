@@ -190,6 +190,7 @@ describe('Capivv Web Implementation', () => {
       const fetchMock = vi.fn().mockResolvedValue({
         ok: true,
         json: async () => ({
+          id: '75342403-09b1-48a1-90b2-b48cddbdc6df',
           template: { components: [{ type: 'headline', props: { text: 'Pro' } }] },
           version: '2.0.0',
           updated_at: '2026-05-04T10:00:00Z',
@@ -207,6 +208,8 @@ describe('Capivv Web Implementation', () => {
       expect(url).toBe(
         'https://app.capivv.com/v1/paywalls/by-identifier/pro/template'
       );
+      // v0.5.60 — issue #23. id must be surfaced for reportPaywallImpression.
+      expect(result.id).toBe('75342403-09b1-48a1-90b2-b48cddbdc6df');
       expect(result.template).toEqual({
         components: [{ type: 'headline', props: { text: 'Pro' } }],
       });
@@ -231,6 +234,8 @@ describe('Capivv Web Implementation', () => {
 
       expect(result.template).toBeNull();
       expect(result.version).toBe('0.0.0');
+      // v0.5.60 — issue #23. No paywall → empty id, not undefined.
+      expect(result.id).toBe('');
 
       vi.unstubAllGlobals();
     });
@@ -723,6 +728,81 @@ describe('Capivv Web Implementation', () => {
       expect(result.productId).toBe('com.interrrupt.app.pro.monthly');
       expect(result.source).toBe('fallback');
       expect(result.variantId).toBeNull();
+
+      vi.unstubAllGlobals();
+    });
+  });
+
+  describe('deleteCurrentUser (v0.5.63 — issue #31)', () => {
+    // Minimal in-memory localStorage so the test is env-independent.
+    function stubLocalStorage() {
+      const store: Record<string, string> = {};
+      vi.stubGlobal('localStorage', {
+        getItem: (k: string) => (k in store ? store[k] : null),
+        setItem: (k: string, v: string) => {
+          store[k] = v;
+        },
+        removeItem: (k: string) => {
+          delete store[k];
+        },
+        clear: () => {
+          for (const k of Object.keys(store)) delete store[k];
+        },
+      });
+      return store;
+    }
+
+    it('persists the deletion_token from identify and sends it to delete-current', async () => {
+      const { CapivvWeb } = await import('../web');
+      const store = stubLocalStorage();
+      const fetchMock = vi.fn()
+        // identify → returns a freshly-minted deletion_token
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            user: { id: 'u1', external_id: 'device-AAA' },
+            entitlements: [],
+            experiment_assignments: [],
+            deletion_token: 'cdt_abc123',
+          }),
+        })
+        // delete-current → success
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ status: 'anonymized' }),
+        });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const sdk = new CapivvWeb();
+      await sdk.configure({ apiKey: 'pk_test_abc' });
+      await sdk.identify({ userId: 'device-AAA' });
+      // token persisted internally
+      expect(store['capivv_deletion_token']).toBe('cdt_abc123');
+
+      const result = await sdk.deleteCurrentUser();
+      expect(result.status).toBe('anonymized');
+
+      // Second call = the delete-current POST with the token in the body.
+      const [url, opts] = fetchMock.mock.calls[1];
+      expect(url).toBe('https://app.capivv.com/v1/sdk/users/delete-current');
+      expect(JSON.parse(opts.body)).toMatchObject({
+        deletion_token: 'cdt_abc123',
+        hard_delete: false,
+      });
+      // Token cleared after successful deletion (single-use).
+      expect(store['capivv_deletion_token']).toBeUndefined();
+
+      vi.unstubAllGlobals();
+    });
+
+    it('throws a clear error when no deletion token is stored', async () => {
+      const { CapivvWeb } = await import('../web');
+      stubLocalStorage();
+      vi.stubGlobal('fetch', vi.fn());
+
+      const sdk = new CapivvWeb();
+      await sdk.configure({ apiKey: 'pk_test_abc' });
+      await expect(sdk.deleteCurrentUser()).rejects.toThrow(/no deletion token/i);
 
       vi.unstubAllGlobals();
     });

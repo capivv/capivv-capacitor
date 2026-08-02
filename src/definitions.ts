@@ -258,6 +258,12 @@ export class CapivvApiError extends Error {
  * paywall identifier (caller should fall back to a hardcoded screen).
  */
 export interface PaywallResult {
+  /**
+   * v0.5.60 — issue #23. The paywall's UUID. Pass straight to
+   * `reportPaywallImpression({ paywallId: paywall.id })`. Empty string
+   * only when no paywall was found for the identifier (template null).
+   */
+  id: string;
   /** Declarative paywall config; pass to `<DynamicPaywall template={...}>`. */
   template: TemplateDefinition | null;
   /** Template version, useful for cache invalidation. */
@@ -373,6 +379,38 @@ export interface CapivvPlugin {
    * @returns Promise that resolves when logout is complete
    */
   logout(): Promise<void>;
+
+  /**
+   * v0.5.63 — issue #31 / RFC #30. Erase the current user's Capivv data —
+   * GDPR right-to-erasure and Apple's in-app account-deletion requirement
+   * (App Store Review Guideline 5.1.1(v)) — directly from a backendless
+   * app, with no secret key.
+   *
+   * **How it's authorized (and why it's safe):** on the first `identify()`
+   * the server mints a per-user *device-bound deletion token*; the SDK
+   * stores it locally and sends it here. The token — not the publishable
+   * key, and not any user id — is the sole authorization, and it resolves
+   * to exactly one user server-side. So a caller can only ever delete
+   * their own record; there is no id to tamper with to target anyone else
+   * (this is the client-safe counterpart to the secret-key-only admin
+   * delete hardened in #24).
+   *
+   * **Scope (be honest with users):** this erases/anonymizes the Capivv
+   * user record. It does **not** cancel the underlying App Store / Google
+   * Play subscription or delete store-side transactions — the user must
+   * still manage/cancel the subscription in the store. Surface that in
+   * your deletion UI.
+   *
+   * @param options.hardDelete `true` removes the row entirely; default
+   *   (`false`) anonymizes (GDPR-recommended — unlinks PII while keeping
+   *   store webhooks routing).
+   * @returns `{ status: 'anonymized' | 'hard_deleted' }`
+   * @throws if no deletion token is available — it is minted on the first
+   *   `identify()`; users created before deletion support (or after local
+   *   storage was cleared) must `identify()` again to obtain one, or be
+   *   deleted server-side with a secret key.
+   */
+  deleteCurrentUser(options?: { hardDelete?: boolean }): Promise<{ status: string }>;
 
   /**
    * Get the current user's information.
@@ -510,6 +548,38 @@ export interface CapivvPlugin {
    * ```
    */
   getPaywall(options: { identifier: string }): Promise<PaywallResult>;
+
+  /**
+   * v0.5.59 — issue #22. Report that the user was shown a paywall.
+   *
+   * Bumps `paywalls.total_views` server-side and, when the user later
+   * completes a purchase within 30 days, attributes that purchase back
+   * to this paywall (populating `paywalls.total_conversions` + linking
+   * `purchases.paywall_id`). Without this call, paywall stats stay at 0.
+   *
+   * Call this once when the paywall screen becomes visible to the
+   * user — typically inside a `useEffect` / `viewDidAppear` /
+   * `onResume`. It is intentionally cheap and best-effort: a failed
+   * call throws but doesn't need to block rendering.
+   *
+   * Pass `experimentId` + `variantId` if you're rendering an A/B
+   * variant so views can later be split by arm.
+   *
+   * @example
+   * ```ts
+   * useEffect(() => {
+   *   Capivv.reportPaywallImpression({ paywallId }).catch(() => {});
+   * }, [paywallId]);
+   * ```
+   */
+  reportPaywallImpression(options: {
+    /** UUID of the paywall (from `PaywallResult.id`). */
+    paywallId: string;
+    /** Optional — the A/B experiment this view belongs to. */
+    experimentId?: string;
+    /** Optional — the variant arm shown to the user. */
+    variantId?: string;
+  }): Promise<{ status: string }>;
 
   /**
    * Get a specific product by identifier.

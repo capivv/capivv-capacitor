@@ -34,8 +34,23 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
         // for actively-running experiments. Issue #20.
         CAPPluginMethod(name: "getVariantForExperiment", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getAssignedProductForExperiment", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "getPromotionalOfferForExperiment", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "getPromotionalOfferForExperiment", returnType: CAPPluginReturnPromise),
+        // v0.5.59 — issue #22. Register before adding the @objc handler
+        // so JS calls actually reach it; the v0.5.35→v0.5.56 native gap
+        // was this list missing three names, and every JS call resolved
+        // UNIMPLEMENTED which .catch quietly swallowed.
+        CAPPluginMethod(name: "reportPaywallImpression", returnType: CAPPluginReturnPromise),
+        // v0.5.63 — issue #31 / RFC #30. Client-safe GDPR self-deletion
+        // (Apple 5.1.1(v)), authorized by the device-bound token stored
+        // on identify. Registered here so the JS call reaches native.
+        CAPPluginMethod(name: "deleteCurrentUser", returnType: CAPPluginReturnPromise)
     ]
+
+    /// v0.5.63 — issue #31. UserDefaults key for the per-user device-bound
+    /// deletion token. NOTE: UserDefaults is app-private but not encrypted;
+    /// Keychain is the hardening follow-up. Blast radius is limited — the
+    /// token only authorizes deleting this user's own record.
+    private let deletionTokenKey = "capivv_deletion_token"
 
     private var apiKey: String?
     private var apiUrl: String = "https://app.capivv.com"
@@ -111,6 +126,12 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                 )
 
                 let user = response["user"] as? [String: Any]
+                // v0.5.63 — issue #31. Persist the device-bound deletion
+                // token minted on the first identify (absent thereafter),
+                // so deleteCurrentUser() can present it later.
+                if let token = response["deletion_token"] as? String, !token.isEmpty {
+                    UserDefaults.standard.set(token, forKey: self.deletionTokenKey)
+                }
                 call.resolve([
                     "userId": userId,
                     "entitlements": response["entitlements"] ?? [],
@@ -443,6 +464,9 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                 let updatedAt = response["updated_at"] as? String
                     ?? ISO8601DateFormatter().string(from: Date())
                 var result: [String: Any] = [
+                    // v0.5.60 — issue #23. Surface the paywall id so callers
+                    // can pass it to reportPaywallImpression.
+                    "id": response["id"] as? String ?? "",
                     "template": template,
                     "version": version,
                     "updatedAt": updatedAt
@@ -469,6 +493,8 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
             } catch let error as NSError where error.code == 404 {
                 // Graceful fallback — no template configured for this id.
                 call.resolve([
+                    // v0.5.60 — issue #23. No paywall → no id.
+                    "id": "",
                     "template": NSNull(),
                     "version": "0.0.0",
                     "updatedAt": ISO8601DateFormatter().string(from: Date()),
@@ -476,6 +502,86 @@ public class CapivvPlugin: CAPPlugin, CAPBridgedPlugin {
                 ])
             } catch {
                 call.reject("Failed to fetch paywall: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// v0.5.59 — issue #22. Report a paywall impression to the server so
+    /// `paywalls.total_views` moves off 0 and later purchases can be
+    /// attributed back to this paywall. Best-effort: `.catch` on the JS
+    /// side is fine.
+    @objc func reportPaywallImpression(_ call: CAPPluginCall) {
+        guard apiKey != nil else {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        guard let paywallId = call.getString("paywallId") else {
+            call.reject("paywallId is required")
+            return
+        }
+        let encodedId = paywallId.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? paywallId
+
+        var body: [String: Any] = [:]
+        if let uid = self.userId {
+            body["user_id"] = uid
+        }
+        if let experimentId = call.getString("experimentId") {
+            body["experiment_id"] = experimentId
+        }
+        if let variantId = call.getString("variantId") {
+            body["variant_id"] = variantId
+        }
+
+        Task {
+            do {
+                let response = try await apiRequest(
+                    method: "POST",
+                    path: "/v1/sdk/paywalls/\(encodedId)/impressions",
+                    body: body
+                )
+                let status = response["status"] as? String ?? "recorded"
+                call.resolve(["status": status])
+            } catch {
+                call.reject("Failed to report paywall impression: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// v0.5.63 — issue #31 / RFC #30. Client-safe GDPR self-deletion.
+    /// Sends the device-bound deletion token (stored on identify) to
+    /// `/v1/sdk/users/delete-current`; the token is the sole authorization
+    /// so only this user's own record can be erased. Clears the token +
+    /// local identity on success.
+    @objc func deleteCurrentUser(_ call: CAPPluginCall) {
+        guard apiKey != nil else {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        guard let token = UserDefaults.standard.string(forKey: deletionTokenKey), !token.isEmpty else {
+            call.reject(
+                "No deletion token available. It is minted on the first identify() — call " +
+                "identify() to obtain one, or delete server-side with a secret key."
+            )
+            return
+        }
+        let hardDelete = call.getBool("hardDelete") ?? false
+
+        Task {
+            do {
+                let response = try await apiRequest(
+                    method: "POST",
+                    path: "/v1/sdk/users/delete-current",
+                    body: ["deletion_token": token, "hard_delete": hardDelete]
+                )
+                // Erased — clear the now-consumed token + local identity.
+                UserDefaults.standard.removeObject(forKey: self.deletionTokenKey)
+                self.userId = nil
+                let status = response["status"] as? String ?? "anonymized"
+                call.resolve(["status": status])
+            } catch {
+                call.reject("Failed to delete current user: \(error.localizedDescription)")
             }
         }
     }

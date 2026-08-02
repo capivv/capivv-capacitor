@@ -176,6 +176,8 @@ export interface CarouselItem {
  * Result of fetching a template from the API
  */
 export interface TemplateLoadResult {
+  /** v0.5.60 — issue #23. Paywall UUID; empty string on 404. */
+  id: string;
   template: TemplateDefinition | null;
   version: string;
   updatedAt: string;

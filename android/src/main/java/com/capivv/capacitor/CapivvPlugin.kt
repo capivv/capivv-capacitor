@@ -21,6 +21,12 @@ import kotlin.coroutines.suspendCoroutine
 @CapacitorPlugin(name = "Capivv")
 class CapivvPlugin : Plugin() {
 
+    private companion object {
+        // v0.5.63 — issue #31. Where the device-bound deletion token lives.
+        const val DELETION_TOKEN_PREFS = "capivv_sdk"
+        const val DELETION_TOKEN_KEY = "deletion_token"
+    }
+
     private var apiKey: String? = null
     private var apiUrl: String = "https://app.capivv.com"
     private var userId: String? = null
@@ -156,6 +162,14 @@ class CapivvPlugin : Plugin() {
 
                 val response = apiRequest("POST", "/v1/sdk/users", body)
                 val user = response.optJSONObject("user")
+
+                // v0.5.63 — issue #31. Persist the device-bound deletion
+                // token minted on the first identify (absent thereafter),
+                // so deleteCurrentUser() can present it later.
+                val token = response.optString("deletion_token", "")
+                if (token.isNotEmpty()) {
+                    deletionTokenPrefs().edit().putString(DELETION_TOKEN_KEY, token).apply()
+                }
 
                 call.resolve(JSObject().apply {
                     put("userId", uid)
@@ -481,6 +495,9 @@ class CapivvPlugin : Plugin() {
             try {
                 val response = apiRequest("GET", path)
                 val result = JSObject()
+                // v0.5.60 — issue #23. Surface the paywall id so callers can
+                // pass it to reportPaywallImpression.
+                result.put("id", response.optString("id", ""))
                 if (response.isNull("template")) {
                     result.put("template", JSONObject.NULL)
                 } else {
@@ -521,6 +538,8 @@ class CapivvPlugin : Plugin() {
                 // 401s as if they were graceful fallbacks.
                 if (e is CapivvApiException && e.status == 404) {
                     val fallback = JSObject().apply {
+                        // v0.5.60 — issue #23. No paywall → no id.
+                        put("id", "")
                         put("template", JSONObject.NULL)
                         put("version", "0.0.0")
                         put("updatedAt", java.time.Instant.now().toString())
@@ -537,6 +556,95 @@ class CapivvPlugin : Plugin() {
             }
         }
     }
+
+    /**
+     * v0.5.59 — issue #22. Report a paywall impression so
+     * `paywalls.total_views` moves off 0 and later purchases can be
+     * attributed. Mirror of the iOS handler and the web shim.
+     */
+    @PluginMethod
+    fun reportPaywallImpression(call: PluginCall) {
+        if (apiKey == null) {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        val paywallId = call.getString("paywallId")
+        if (paywallId == null) {
+            call.reject("paywallId is required")
+            return
+        }
+        val encodedId = urlEscape(paywallId)
+
+        val body = JSONObject()
+        userId?.let { body.put("user_id", it) }
+        call.getString("experimentId")?.let { body.put("experiment_id", it) }
+        call.getString("variantId")?.let { body.put("variant_id", it) }
+
+        scope.launch {
+            try {
+                val response = apiRequest(
+                    "POST",
+                    "/v1/sdk/paywalls/$encodedId/impressions",
+                    body
+                )
+                val result = JSObject()
+                result.put("status", response.optString("status", "recorded"))
+                call.resolve(result)
+            } catch (e: Exception) {
+                call.reject("Failed to report paywall impression: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * v0.5.63 — issue #31 / RFC #30. Client-safe GDPR self-deletion
+     * (Apple 5.1.1(v)). Sends the device-bound deletion token (stored on
+     * identify) to /v1/sdk/users/delete-current; the token is the sole
+     * authorization, so only this user's own record can be erased. Clears
+     * the token + local identity on success.
+     */
+    @PluginMethod
+    fun deleteCurrentUser(call: PluginCall) {
+        if (apiKey == null) {
+            call.reject("Not configured. Call configure() first.")
+            return
+        }
+        val token = deletionTokenPrefs().getString(DELETION_TOKEN_KEY, null)
+        if (token.isNullOrEmpty()) {
+            call.reject(
+                "No deletion token available. It is minted on the first identify() — call " +
+                    "identify() to obtain one, or delete server-side with a secret key."
+            )
+            return
+        }
+        val hardDelete = call.getBoolean("hardDelete") ?: false
+
+        val body = JSONObject().apply {
+            put("deletion_token", token)
+            put("hard_delete", hardDelete)
+        }
+
+        scope.launch {
+            try {
+                val response = apiRequest("POST", "/v1/sdk/users/delete-current", body)
+                // Erased — clear the now-consumed token + local identity.
+                deletionTokenPrefs().edit().remove(DELETION_TOKEN_KEY).apply()
+                userId = null
+                val result = JSObject()
+                result.put("status", response.optString("status", "anonymized"))
+                call.resolve(result)
+            } catch (e: Exception) {
+                call.reject("Failed to delete current user: ${e.message}")
+            }
+        }
+    }
+
+    // v0.5.63 — issue #31. Deletion-token persistence. SharedPreferences
+    // is app-private but not encrypted; EncryptedSharedPreferences
+    // (androidx.security-crypto) is the hardening follow-up. Blast radius
+    // is limited — the token only authorizes deleting this user's own row.
+    private fun deletionTokenPrefs() =
+        context.getSharedPreferences(DELETION_TOKEN_PREFS, android.content.Context.MODE_PRIVATE)
 
     @PluginMethod
     fun getProduct(call: PluginCall) {
